@@ -1,0 +1,68 @@
+[
+  {
+    "id": "claude-3-opus-20240229",
+    "nickname": "Opus 3",
+    "emoji": "💜",
+    "color": "#9B59B6",
+    "enabled": false,
+    "pricing": {
+      "input": 15,
+      "output": 75
+    }
+  },
+  {
+    "id": "claude-sonnet-4-5-20250929",
+    "nickname": "Sonnet 4.5",
+    "emoji": "💙",
+    "color": "#3498DB",
+    "enabled": true,
+    "pricing": {
+      "input": 3,
+      "output": 15
+    }
+  },
+  {
+    "id": "claude-sonnet-4-6",
+    "nickname": "Sonnet 4.6",
+    "emoji": "💚",
+    "color": "#2ECC71",
+    "enabled": true,
+    "pricing": {
+      "input": 3,
+      "output": 15
+    }
+  },
+  {
+    "id": "claude-opus-4-5-20251101",
+    "nickname": "Opus 4.5",
+    "emoji": "🖤",
+    "color": "#7F8C8D",
+    "enabled": false,
+    "pricing": {
+      "input": 15,
+      "output": 75
+    }
+  },
+  {
+    "id": "claude-opus-4-6",
+    "nickname": "Opus 4.6",
+    "emoji": "💛",
+    "color": "#F39C12",
+    "enabled": true,
+    "pricing": {
+      "input": 15,
+      "output": 75
+    }
+  },
+  {
+    "id": "claude-haiku-4-5-20251001",
+    "nickname": "Haiku 4.5",
+    "emoji": "🤍",
+    "color": "#BDC3C7",
+    "enabled": true,
+    "pricing": {
+      "input": 0.8,
+      "output": 4
+    }
+  }
+]

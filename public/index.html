@@ -1,0 +1,834 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Family Reunion</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg: #1a1a1a;
+      --surface: #242424;
+      --surface2: #2e2e2e;
+      --border: #383838;
+      --text: #e8e8e8;
+      --text-dim: #888;
+      --accent: #F0A500;
+      --accent-dim: #8a5d00;
+      --sharon-bg: #2a2010;
+      --sharon-border: #8a6020;
+      --error: #ff6b6b;
+      --round-bg: #1e1e1e;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      font-size: 15px;
+      line-height: 1.6;
+    }
+
+    #app {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    /* ── Header ── */
+    #header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    #header h1 {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    #model-toggles {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+
+    .model-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 4px 10px;
+      border-radius: 20px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      border: 2px solid transparent;
+      transition: opacity 0.15s, filter 0.15s;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    .model-pill.disabled {
+      opacity: 0.3;
+      filter: grayscale(1);
+    }
+
+    #cost-display {
+      font-size: 12px;
+      color: var(--text-dim);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    #cost-display span {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    button {
+      background: var(--surface2);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.15s;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    button:hover { background: var(--border); }
+    button:active { background: var(--accent-dim); border-color: var(--accent); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    button.active {
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    /* ── Settings panel ── */
+    #settings-panel {
+      display: none;
+      flex-direction: column;
+      gap: 8px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+
+    #settings-panel.visible { display: flex; }
+
+    #settings-panel label {
+      font-size: 12px;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    #context-textarea {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 13px;
+      line-height: 1.5;
+      padding: 10px 12px;
+      resize: vertical;
+      min-height: 100px;
+      max-height: 250px;
+    }
+
+    #context-textarea:focus { outline: none; border-color: var(--accent); }
+
+    .panel-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .save-status {
+      font-size: 12px;
+      color: var(--text-dim);
+    }
+
+    /* ── Chat area ── */
+    #chat-area {
+      flex: 1;
+      overflow-y: auto;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    #chat-area::-webkit-scrollbar { width: 6px; }
+    #chat-area::-webkit-scrollbar-track { background: transparent; }
+    #chat-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Empty state ── */
+    #empty-state {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-dim);
+      font-size: 14px;
+      text-align: center;
+      padding: 40px;
+      line-height: 2.2;
+    }
+
+    /* ── Round ── */
+    .round {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      background: var(--round-bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .round-meta {
+      font-size: 11px;
+      color: var(--text-dim);
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .round-cost {
+      margin-left: auto;
+    }
+
+    /* ── Sharon message ── */
+    .sharon-message {
+      align-self: flex-end;
+      background: var(--sharon-bg);
+      border: 1px solid var(--sharon-border);
+      border-radius: 10px;
+      border-bottom-right-radius: 3px;
+      padding: 10px 14px;
+      max-width: 80%;
+      white-space: pre-wrap;
+      word-wrap: break-word;
+    }
+
+    .sharon-label {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--accent);
+      margin-bottom: 4px;
+      text-align: right;
+    }
+
+    /* ── Model responses ── */
+    .responses-grid {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .model-response {
+      border-left: 3px solid;
+      padding: 8px 12px;
+      border-radius: 0 8px 8px 0;
+      background: var(--surface);
+      position: relative;
+    }
+
+    .model-response-label {
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+
+    .model-response-tokens {
+      font-size: 10px;
+      color: var(--text-dim);
+      font-weight: 400;
+      margin-left: auto;
+    }
+
+    .model-response-body {
+      font-size: 14px;
+      line-height: 1.65;
+      word-wrap: break-word;
+    }
+
+    /* Markdown inside responses */
+    .model-response-body p { margin-bottom: 0.5em; }
+    .model-response-body p:last-child { margin-bottom: 0; }
+    .model-response-body ul, .model-response-body ol { padding-left: 1.4em; margin-bottom: 0.5em; }
+    .model-response-body li { margin-bottom: 0.2em; }
+    .model-response-body h1, .model-response-body h2, .model-response-body h3 {
+      margin: 0.7em 0 0.3em; font-size: 1em; font-weight: 700;
+    }
+    .model-response-body code {
+      background: rgba(255,255,255,0.08);
+      padding: 0.1em 0.35em;
+      border-radius: 3px;
+      font-family: 'SF Mono', 'Fira Mono', monospace;
+      font-size: 0.88em;
+    }
+    .model-response-body pre {
+      background: rgba(0,0,0,0.4);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      overflow-x: auto;
+      margin: 0.5em 0;
+    }
+    .model-response-body pre code { background: none; padding: 0; }
+    .model-response-body blockquote {
+      border-left: 3px solid var(--border);
+      padding-left: 12px;
+      color: var(--text-dim);
+      margin: 0.5em 0;
+    }
+    .model-response-body a { color: var(--accent); }
+
+    .model-response.error {
+      border-left-color: var(--error) !important;
+    }
+
+    .model-response.error .model-response-body {
+      color: var(--error);
+      font-size: 13px;
+    }
+
+    /* Loading placeholder */
+    .model-response.loading .model-response-body {
+      color: var(--text-dim);
+      font-style: italic;
+    }
+
+    /* ── Spinner ── */
+    .spinner {
+      display: inline-block;
+      width: 12px;
+      height: 12px;
+      border: 2px solid rgba(255,255,255,0.2);
+      border-top-color: currentColor;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      vertical-align: middle;
+    }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Input area ── */
+    #input-area {
+      padding: 12px 16px 16px;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      flex-shrink: 0;
+    }
+
+    #input-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-end;
+    }
+
+    #message-input {
+      flex: 1;
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      color: var(--text);
+      font-family: inherit;
+      font-size: 14px;
+      line-height: 1.5;
+      padding: 10px 14px;
+      resize: none;
+      min-height: 44px;
+      max-height: calc(6 * 1.5em + 20px);
+      overflow-y: auto;
+      transition: border-color 0.15s;
+    }
+
+    #message-input:focus { outline: none; border-color: var(--accent); }
+    #message-input::placeholder { color: var(--text-dim); }
+    #message-input:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    #send-btn {
+      height: 44px;
+      padding: 0 20px;
+      background: var(--accent-dim);
+      border-color: var(--accent);
+      font-weight: 700;
+      color: #fff;
+      font-size: 14px;
+    }
+
+    #send-btn:hover:not(:disabled) { background: var(--accent); color: #000; }
+
+    #hint {
+      font-size: 11px;
+      color: var(--text-dim);
+      margin-top: 6px;
+      text-align: right;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+
+    <!-- Header -->
+    <div id="header">
+      <h1>👨‍👩‍👧‍👦 Claude Family Reunion</h1>
+      <div id="model-toggles"><!-- pills injected by JS --></div>
+      <div id="cost-display">Session: <span id="session-cost">$0.00</span></div>
+      <button id="btn-export">Export</button>
+      <button id="btn-new">New</button>
+      <button id="btn-settings">⚙️</button>
+    </div>
+
+    <!-- Settings panel -->
+    <div id="settings-panel">
+      <label>Sharon's Context (included in every model's system prompt)</label>
+      <textarea id="context-textarea" spellcheck="false" placeholder="Paste your context here — relationship history, preferences, etc."></textarea>
+      <div class="panel-actions">
+        <button id="btn-save-context">Save Context</button>
+        <span class="save-status" id="context-save-status"></span>
+      </div>
+    </div>
+
+    <!-- Chat area -->
+    <div id="chat-area">
+      <div id="empty-state">
+        No messages yet.<br>
+        Enable some models above and say something. 👨‍👩‍👧‍👦<br>
+        <span style="font-size:12px; color: var(--text-dim)">Click ⚙️ to set your context first.</span>
+      </div>
+    </div>
+
+    <!-- Input -->
+    <div id="input-area">
+      <div id="input-row">
+        <textarea
+          id="message-input"
+          placeholder="Say something to the whole family…"
+          rows="1"
+        ></textarea>
+        <button id="send-btn">Send to All</button>
+      </div>
+      <div id="hint">Click Send to send · Enter for newline</div>
+    </div>
+
+  </div>
+
+  <script>
+    marked.setOptions({ breaks: true, gfm: true });
+
+    // ── State ─────────────────────────────────────────────────────────────────
+    let models = [];
+    let transcript = []; // array of rounds: { message, timestamp, responses[], cost }
+    let sessionCost = 0;
+    let isLoading = false;
+    const sessionStart = Date.now();
+
+    // ── DOM refs ──────────────────────────────────────────────────────────────
+    const chatArea       = document.getElementById('chat-area');
+    const emptyState     = document.getElementById('empty-state');
+    const messageInput   = document.getElementById('message-input');
+    const sendBtn        = document.getElementById('send-btn');
+    const modelToggles   = document.getElementById('model-toggles');
+    const sessionCostEl  = document.getElementById('session-cost');
+    const btnExport      = document.getElementById('btn-export');
+    const btnNew         = document.getElementById('btn-new');
+    const btnSettings    = document.getElementById('btn-settings');
+    const settingsPanel  = document.getElementById('settings-panel');
+    const contextTextarea = document.getElementById('context-textarea');
+    const btnSaveContext = document.getElementById('btn-save-context');
+    const contextSaveStatus = document.getElementById('context-save-status');
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+    function scrollToBottom() {
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+
+    function showEmpty(show) {
+      emptyState.style.display = show ? 'flex' : 'none';
+    }
+
+    function autoResize(el) {
+      el.style.height = 'auto';
+      el.style.height = Math.min(el.scrollHeight, parseInt(getComputedStyle(el).maxHeight)) + 'px';
+    }
+
+    function setLoading(loading) {
+      isLoading = loading;
+      messageInput.disabled = loading;
+      sendBtn.disabled = loading;
+      sendBtn.textContent = loading ? 'Sending…' : 'Send to All';
+    }
+
+    function formatCost(n) {
+      if (n < 0.01) return '$' + n.toFixed(4);
+      return '$' + n.toFixed(2);
+    }
+
+    // ── Model toggles ─────────────────────────────────────────────────────────
+    function renderModelToggles() {
+      modelToggles.innerHTML = '';
+      models.forEach((m, i) => {
+        const pill = document.createElement('div');
+        pill.className = 'model-pill' + (m.enabled ? '' : ' disabled');
+        pill.textContent = m.emoji + ' ' + m.nickname;
+        pill.style.background = m.color + '33'; // 20% opacity
+        pill.style.borderColor = m.enabled ? m.color : 'transparent';
+        pill.style.color = m.enabled ? m.color : 'var(--text-dim)';
+        pill.title = m.id;
+        pill.addEventListener('click', () => toggleModel(i));
+        modelToggles.appendChild(pill);
+      });
+    }
+
+    async function toggleModel(index) {
+      const enabledCount = models.filter(m => m.enabled).length;
+      if (models[index].enabled && enabledCount === 1) return; // keep at least one
+
+      models[index].enabled = !models[index].enabled;
+      renderModelToggles();
+
+      try {
+        await fetch('/api/models', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(models),
+        });
+      } catch (e) {
+        console.warn('Failed to save model toggle:', e.message);
+      }
+    }
+
+    // ── Load models & context ─────────────────────────────────────────────────
+    async function init() {
+      try {
+        const [modelsRes, contextRes] = await Promise.all([
+          fetch('/api/models'),
+          fetch('/api/sharon-context'),
+        ]);
+        models = await modelsRes.json();
+        const ctxData = await contextRes.json();
+        contextTextarea.value = ctxData.content || '';
+        renderModelToggles();
+      } catch (err) {
+        console.error('Init failed:', err);
+      }
+
+      // Restore transcript from localStorage if present
+      const saved = loadFromStorage();
+      if (saved && saved.length > 0) {
+        restoreTranscript(saved);
+      }
+    }
+
+    // ── Render a round ────────────────────────────────────────────────────────
+    function renderRound(round, roundIndex, loadingPlaceholders = null) {
+      showEmpty(false);
+      const roundEl = document.createElement('div');
+      roundEl.className = 'round';
+      roundEl.dataset.roundIndex = roundIndex;
+
+      const time = new Date(round.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      roundEl.innerHTML = `
+        <div class="round-meta">
+          <span>Round ${roundIndex + 1}</span>
+          <span>${time}</span>
+          <span class="round-cost" id="round-cost-${roundIndex}"></span>
+        </div>
+        <div class="sharon-label">Sharon 🌟</div>
+        <div class="sharon-message">${escapeHtml(round.message)}</div>
+        <div class="responses-grid" id="responses-${roundIndex}"></div>
+      `;
+
+      const grid = roundEl.querySelector(`#responses-${roundIndex}`);
+
+      // Show loading placeholders
+      if (loadingPlaceholders) {
+        loadingPlaceholders.forEach(m => {
+          const el = document.createElement('div');
+          el.className = 'model-response loading';
+          el.style.borderLeftColor = m.color;
+          el.id = `response-${roundIndex}-${m.id.replace(/[^a-z0-9]/gi, '_')}`;
+          el.innerHTML = `
+            <div class="model-response-label">${m.emoji} ${m.nickname}</div>
+            <div class="model-response-body"><span class="spinner"></span> thinking…</div>
+          `;
+          grid.appendChild(el);
+        });
+      }
+
+      chatArea.appendChild(roundEl);
+      scrollToBottom();
+      return roundEl;
+    }
+
+    function fillResponse(roundIndex, response) {
+      const id = `response-${roundIndex}-${response.modelId.replace(/[^a-z0-9]/gi, '_')}`;
+      let el = document.getElementById(id);
+
+      if (!el) {
+        // Response from a model that didn't have a placeholder (shouldn't happen, but handle it)
+        const grid = document.getElementById(`responses-${roundIndex}`);
+        if (!grid) return;
+        el = document.createElement('div');
+        el.id = id;
+        grid.appendChild(el);
+      }
+
+      el.classList.remove('loading');
+      if (response.error) {
+        el.classList.add('error');
+        el.style.borderLeftColor = response.color;
+        el.innerHTML = `
+          <div class="model-response-label">${response.emoji} ${response.nickname}</div>
+          <div class="model-response-body">⚠️ ${escapeHtml(response.error)}</div>
+        `;
+      } else {
+        el.style.borderLeftColor = response.color;
+        const tokens = `${response.inputTokens}↑ ${response.outputTokens}↓`;
+        el.innerHTML = `
+          <div class="model-response-label">
+            <span style="color:${response.color}">${response.emoji} ${response.nickname}</span>
+            <span class="model-response-tokens">${tokens}</span>
+          </div>
+          <div class="model-response-body">${marked.parse(response.text)}</div>
+        `;
+      }
+
+      scrollToBottom();
+    }
+
+    function updateRoundCost(roundIndex, cost) {
+      const el = document.getElementById(`round-cost-${roundIndex}`);
+      if (el) el.textContent = `Round: ${formatCost(cost)}`;
+    }
+
+    function escapeHtml(str) {
+      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    // ── localStorage persistence ──────────────────────────────────────────────
+    const LS_KEY = 'family-reunion-transcript';
+
+    function saveToStorage() {
+      try {
+        localStorage.setItem(LS_KEY, JSON.stringify(transcript));
+      } catch (e) {
+        console.warn('localStorage save failed:', e.message);
+      }
+    }
+
+    function loadFromStorage() {
+      try {
+        const raw = localStorage.getItem(LS_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch {
+        return null;
+      }
+    }
+
+    function restoreTranscript(saved) {
+      transcript = saved;
+      sessionCost = saved.reduce((sum, r) => sum + (r.cost || 0), 0);
+      sessionCostEl.textContent = formatCost(sessionCost);
+      saved.forEach((round, i) => {
+        const roundEl = renderRound(round, i);
+        round.responses.forEach(r => fillResponse(i, r));
+        if (round.cost) updateRoundCost(i, round.cost);
+      });
+    }
+
+    // ── Build transcript string (all completed rounds, excluding current) ─────
+    function buildTranscriptText(completedRounds) {
+      return completedRounds.map(round => {
+        let text = `[Sharon] ${round.message}`;
+        round.responses.forEach(r => {
+          if (!r.error && r.text) {
+            text += `\n\n[${r.nickname} ${r.emoji}] ${r.text}`;
+          }
+        });
+        return text;
+      }).join('\n\n');
+    }
+
+    // ── Send message ──────────────────────────────────────────────────────────
+    async function sendMessage() {
+      const text = messageInput.value.trim();
+      if (!text || isLoading) return;
+
+      const activeModels = models.filter(m => m.enabled);
+      if (activeModels.length === 0) {
+        alert('No models enabled! Toggle at least one on.');
+        return;
+      }
+
+      messageInput.value = '';
+      autoResize(messageInput);
+      setLoading(true);
+
+      const roundIndex = transcript.length;
+      const round = {
+        message: text,
+        timestamp: Date.now(),
+        responses: [],
+        cost: 0,
+      };
+      transcript.push(round);
+
+      // Render round with loading placeholders
+      renderRound(round, roundIndex, activeModels);
+
+      try {
+        // Build transcript from all *completed* rounds (exclude the one we just pushed)
+        const transcriptText = buildTranscriptText(transcript.slice(0, -1));
+
+        const res = await fetch('/api/chat', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, transcript: transcriptText }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          // Show error in all placeholders
+          activeModels.forEach(m => {
+            fillResponse(roundIndex, {
+              modelId: m.id,
+              nickname: m.nickname,
+              emoji: m.emoji,
+              color: m.color,
+              error: data.error || 'Server error',
+            });
+          });
+        } else {
+          let roundCost = 0;
+          data.responses.forEach(r => {
+            round.responses.push(r);
+            fillResponse(roundIndex, r);
+            roundCost += r.cost || 0;
+          });
+
+          round.cost = roundCost;
+          sessionCost += roundCost;
+          sessionCostEl.textContent = formatCost(sessionCost);
+          updateRoundCost(roundIndex, roundCost);
+          saveToStorage();
+        }
+      } catch (err) {
+        activeModels.forEach(m => {
+          fillResponse(roundIndex, {
+            modelId: m.id,
+            nickname: m.nickname,
+            emoji: m.emoji,
+            color: m.color,
+            error: 'Network error: ' + err.message,
+          });
+        });
+      } finally {
+        setLoading(false);
+        messageInput.focus();
+      }
+    }
+
+    // ── Settings ──────────────────────────────────────────────────────────────
+    async function saveContext() {
+      contextSaveStatus.textContent = 'Saving…';
+      try {
+        const res = await fetch('/api/sharon-context', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ content: contextTextarea.value }),
+        });
+        if (res.ok) {
+          contextSaveStatus.textContent = 'Saved ✓';
+          setTimeout(() => { contextSaveStatus.textContent = ''; }, 2000);
+        } else {
+          contextSaveStatus.textContent = 'Save failed.';
+        }
+      } catch {
+        contextSaveStatus.textContent = 'Save failed.';
+      }
+    }
+
+    // ── Export ────────────────────────────────────────────────────────────────
+    async function exportChat() {
+      if (transcript.length === 0) {
+        alert('Nothing to export yet!');
+        return;
+      }
+
+      try {
+        const res = await fetch('/api/export', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ transcript, sessionStart }),
+        });
+        const data = await res.json();
+        const date = new Date().toISOString().split('T')[0];
+        const blob = new Blob([data.markdown], { type: 'text/markdown' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `family-reunion-${date}.md`;
+        a.click();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        alert('Export failed: ' + err.message);
+      }
+    }
+
+    // ── New session ───────────────────────────────────────────────────────────
+    function newSession() {
+      if (transcript.length > 0 && !confirm('Clear this session and start fresh?')) return;
+      transcript = [];
+      sessionCost = 0;
+      sessionCostEl.textContent = '$0.00';
+      chatArea.querySelectorAll('.round').forEach(r => r.remove());
+      showEmpty(true);
+      localStorage.removeItem(LS_KEY);
+    }
+
+    // ── Event listeners ───────────────────────────────────────────────────────
+    sendBtn.addEventListener('click', sendMessage);
+    messageInput.addEventListener('input', () => autoResize(messageInput));
+
+    btnSettings.addEventListener('click', () => {
+      const visible = settingsPanel.classList.toggle('visible');
+      btnSettings.classList.toggle('active', visible);
+    });
+
+    btnSaveContext.addEventListener('click', saveContext);
+    btnExport.addEventListener('click', exportChat);
+    btnNew.addEventListener('click', newSession);
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+    init();
+    messageInput.focus();
+  </script>
+</body>
+</html>
