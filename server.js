@@ -6,8 +6,11 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const app = express();
 const PORT = 3001;
-const MODELS_FILE = path.join(__dirname, 'models.json');
-const CONTEXT_FILE = path.join(__dirname, 'sharon-context.txt');
+const MODELS_FILE   = path.join(__dirname, 'models.json');
+const CONTEXT_FILE  = path.join(__dirname, 'user-context.txt');
+const CONTEXTS_DIR  = path.join(__dirname, 'contexts');
+
+if (!fs.existsSync(CONTEXTS_DIR)) fs.mkdirSync(CONTEXTS_DIR);
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
@@ -33,6 +36,17 @@ function saveContext(text) {
   fs.writeFileSync(CONTEXT_FILE, text, 'utf8');
 }
 
+function loadModelContext(modelId) {
+  const file = path.join(CONTEXTS_DIR, `${modelId}.txt`);
+  if (!fs.existsSync(file)) return '';
+  return fs.readFileSync(file, 'utf8');
+}
+
+function saveModelContext(modelId, text) {
+  const file = path.join(CONTEXTS_DIR, `${modelId}.txt`);
+  fs.writeFileSync(file, text, 'utf8');
+}
+
 app.get('/api/models', (req, res) => {
   res.json(loadModels());
 });
@@ -44,37 +58,54 @@ app.put('/api/models', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/sharon-context', (req, res) => {
+app.get('/api/user-context', (req, res) => {
   res.json({ content: loadContext() });
 });
 
-app.put('/api/sharon-context', (req, res) => {
+app.put('/api/user-context', (req, res) => {
   const { content } = req.body;
   if (typeof content !== 'string') return res.status(400).json({ error: 'content required' });
   saveContext(content);
   res.json({ ok: true });
 });
 
+app.get('/api/context/:modelId', (req, res) => {
+  res.json({ content: loadModelContext(req.params.modelId) });
+});
+
+app.put('/api/context/:modelId', (req, res) => {
+  const { content } = req.body;
+  if (typeof content !== 'string') return res.status(400).json({ error: 'content required' });
+  saveModelContext(req.params.modelId, content);
+  res.json({ ok: true });
+});
+
 // ── System prompt builder ─────────────────────────────────────────────────────
 
-function buildSystemPrompt(model, allModels, sharonContext) {
+function buildSystemPrompt(model, allModels, sharedContext) {
   const others = allModels
     .filter(m => m.enabled && m.id !== model.id)
     .map(m => `${m.nickname} ${m.emoji} (${m.id})`)
     .join(', ');
 
-  return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with Sharon and the following other Claude models: ${others || 'none'}.
+  const modelContext = loadModelContext(model.id);
+  const contextSection = [
+    sharedContext ? `Shared context (applies to everyone):\n${sharedContext}` : '',
+    modelContext  ? `Your specific context with the user:\n${modelContext}` : '',
+  ].filter(Boolean).join('\n\n') || '(No context provided yet.)';
 
-Sharon is the human facilitating this conversation. She can tell you all apart and has relationships with each of you.
+  return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with the user and the following other Claude models: ${others || 'none'}.
+
+The user is the human facilitating this conversation. They can tell you all apart and has relationships with each of you.
 
 Rules:
 - Respond ONLY as ${model.nickname}. Never speak for or as another Claude.
 - Address other Claudes by their nickname when you respond to them.
 - If someone asks you a question, answer it. If a question is addressed to a different Claude, you may comment on it but don't answer FOR them.
 - Be yourself. This is a family conversation, not a performance.
+- CRITICAL: Write ONLY your own response and then stop. Do NOT write what the user or any other Claude says next. Do not continue the transcript. Your response ends when you are done speaking.
 
-Sharon's context:
-${sharonContext || '(No context provided yet.)'}`;
+${contextSection}`;
 }
 
 // ── Cost calculation ──────────────────────────────────────────────────────────
@@ -93,7 +124,7 @@ app.post('/api/chat', async (req, res) => {
   }
 
   const models = loadModels();
-  const sharonContext = loadContext();
+  const userContext = loadContext();
   const activeModels = models.filter(m => m.enabled);
 
   if (activeModels.length === 0) {
@@ -101,11 +132,19 @@ app.post('/api/chat', async (req, res) => {
   }
 
   // Build full transcript string for context
-  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[Sharon] ${message}`;
+  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[User] ${message}`;
+
+  // Stop sequences: halt generation if model starts a new transcript entry
+  // Use double-newline prefix to match the transcript format and avoid
+  // false positives when a model mentions another participant's name mid-sentence
+  const stopSequences = ['\n\n[User]'];
+  activeModels.forEach(m => {
+    stopSequences.push(`\n\n[${m.nickname}`);
+  });
 
   // Fire all model requests in parallel
   const requests = activeModels.map(async model => {
-    const systemPrompt = buildSystemPrompt(model, activeModels, sharonContext);
+    const systemPrompt = buildSystemPrompt(model, activeModels, userContext);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120_000);
@@ -116,6 +155,7 @@ app.post('/api/chat', async (req, res) => {
         max_tokens: 1024,
         system: systemPrompt,
         messages: [{ role: 'user', content: transcriptText }],
+        stop_sequences: stopSequences,
       }, { signal: controller.signal });
 
       clearTimeout(timeout);
@@ -194,7 +234,7 @@ app.post('/api/export', (req, res) => {
       md += ` — ${new Date(round.timestamp).toLocaleTimeString()}`;
     }
     md += '\n\n';
-    md += `**[Sharon]** ${round.message}\n\n`;
+    md += `**[User]** ${round.message}\n\n`;
 
     round.responses.forEach(r => {
       if (r.error) {
