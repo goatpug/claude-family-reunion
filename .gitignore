@@ -1,4 +1,5 @@
 .env
 node_modules/
 user-context.txt
+user-profile.json
 contexts/

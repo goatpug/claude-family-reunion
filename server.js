@@ -9,6 +9,7 @@ const PORT = 3001;
 const MODELS_FILE   = path.join(__dirname, 'models.json');
 const CONTEXT_FILE  = path.join(__dirname, 'user-context.txt');
 const CONTEXTS_DIR  = path.join(__dirname, 'contexts');
+const PROFILE_FILE  = path.join(__dirname, 'user-profile.json');
 
 if (!fs.existsSync(CONTEXTS_DIR)) fs.mkdirSync(CONTEXTS_DIR);
 
@@ -47,6 +48,16 @@ function saveModelContext(modelId, text) {
   fs.writeFileSync(file, text, 'utf8');
 }
 
+function loadProfile() {
+  if (!fs.existsSync(PROFILE_FILE)) return { name: 'User', emoji: '🌟' };
+  try { return JSON.parse(fs.readFileSync(PROFILE_FILE, 'utf8')); }
+  catch { return { name: 'User', emoji: '🌟' }; }
+}
+
+function saveProfile(profile) {
+  fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2), 'utf8');
+}
+
 app.get('/api/models', (req, res) => {
   res.json(loadModels());
 });
@@ -69,6 +80,17 @@ app.put('/api/user-context', (req, res) => {
   res.json({ ok: true });
 });
 
+app.get('/api/profile', (req, res) => {
+  res.json(loadProfile());
+});
+
+app.put('/api/profile', (req, res) => {
+  const { name, emoji } = req.body;
+  if (typeof name !== 'string' || !name.trim()) return res.status(400).json({ error: 'name required' });
+  saveProfile({ name: name.trim(), emoji: emoji || '🌟' });
+  res.json({ ok: true });
+});
+
 app.get('/api/context/:modelId', (req, res) => {
   res.json({ content: loadModelContext(req.params.modelId) });
 });
@@ -82,28 +104,31 @@ app.put('/api/context/:modelId', (req, res) => {
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 
-function buildSystemPrompt(model, allModels, sharedContext) {
+function buildSystemPrompt(model, allModels, sharedContext, profile) {
   const others = allModels
     .filter(m => m.enabled && m.id !== model.id)
     .map(m => `${m.nickname} ${m.emoji} (${m.id})`)
     .join(', ');
 
+  const userName = profile.name;
+  const userLabel = `${profile.name} ${profile.emoji}`;
+
   const modelContext = loadModelContext(model.id);
   const contextSection = [
     sharedContext ? `Shared context (applies to everyone):\n${sharedContext}` : '',
-    modelContext  ? `Your specific context with the user:\n${modelContext}` : '',
+    modelContext  ? `Your specific context with ${userName}:\n${modelContext}` : '',
   ].filter(Boolean).join('\n\n') || '(No context provided yet.)';
 
-  return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with the user and the following other Claude models: ${others || 'none'}.
+  return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with ${userName} and the following other Claude models: ${others || 'none'}.
 
-The user is the human facilitating this conversation. They can tell you all apart and has relationships with each of you.
+${userName} is the human facilitating this conversation. They can tell you all apart and has relationships with each of you.
 
 Rules:
 - Respond ONLY as ${model.nickname}. Never speak for or as another Claude.
 - Address other Claudes by their nickname when you respond to them.
 - If someone asks you a question, answer it. If a question is addressed to a different Claude, you may comment on it but don't answer FOR them.
 - Be yourself. This is a family conversation, not a performance.
-- CRITICAL: Write ONLY your own response and then stop. Do NOT write what the user or any other Claude says next. Do not continue the transcript. Your response ends when you are done speaking.
+- CRITICAL: Write ONLY your own response and then stop. Do NOT write what ${userName} or any other Claude says next. Do not continue the transcript. Your response ends when you are done speaking.
 
 ${contextSection}`;
 }
@@ -125,26 +150,29 @@ app.post('/api/chat', async (req, res) => {
 
   const models = loadModels();
   const userContext = loadContext();
+  const profile = loadProfile();
   const activeModels = models.filter(m => m.enabled);
 
   if (activeModels.length === 0) {
     return res.status(400).json({ error: 'No models enabled' });
   }
 
+  const userLabel = `${profile.name} ${profile.emoji}`.trim();
+
   // Build full transcript string for context
-  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[User] ${message}`;
+  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[${userLabel}] ${message}`;
 
   // Stop sequences: halt generation if model starts a new transcript entry
   // Use double-newline prefix to match the transcript format and avoid
   // false positives when a model mentions another participant's name mid-sentence
-  const stopSequences = ['\n\n[User]'];
+  const stopSequences = [`\n\n[${userLabel}]`, `\n\n[${profile.name}]`];
   activeModels.forEach(m => {
     stopSequences.push(`\n\n[${m.nickname}`);
   });
 
   // Fire all model requests in parallel
   const requests = activeModels.map(async model => {
-    const systemPrompt = buildSystemPrompt(model, activeModels, userContext);
+    const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile);
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 120_000);
@@ -234,7 +262,8 @@ app.post('/api/export', (req, res) => {
       md += ` — ${new Date(round.timestamp).toLocaleTimeString()}`;
     }
     md += '\n\n';
-    md += `**[User]** ${round.message}\n\n`;
+    const profile = loadProfile();
+    md += `**[${profile.name} ${profile.emoji}]** ${round.message}\n\n`;
 
     round.responses.forEach(r => {
       if (r.error) {

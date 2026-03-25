@@ -426,6 +426,13 @@
 
     <!-- Settings panel -->
     <div id="settings-panel">
+      <div class="panel-actions" style="gap:6px; margin-bottom:4px;">
+        <span style="font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.08em; flex-shrink:0;">Your name</span>
+        <input id="profile-name" type="text" maxlength="32" placeholder="User" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:13px;padding:4px 8px;width:140px;" />
+        <input id="profile-emoji" type="text" maxlength="4" placeholder="🌟" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:16px;padding:4px 6px;width:48px;text-align:center;" />
+        <button id="btn-save-profile" style="padding:4px 10px;font-size:12px;">Save</button>
+        <span class="save-status" id="profile-save-status"></span>
+      </div>
       <div id="context-tabs">
         <div class="context-tab active shared" data-tab="shared">🌟 Shared</div>
         <!-- model tabs injected by JS -->
@@ -470,6 +477,9 @@
     let sessionCost = 0;
     let isLoading = false;
     const sessionStart = Date.now();
+    let profile = { name: 'User', emoji: '🌟' };
+
+    function userLabel() { return `${profile.name} ${profile.emoji}`.trim(); }
 
     // ── DOM refs ──────────────────────────────────────────────────────────────
     const chatArea       = document.getElementById('chat-area');
@@ -486,6 +496,10 @@
     const btnSaveContext     = document.getElementById('btn-save-context');
     const contextSaveStatus  = document.getElementById('context-save-status');
     const contextTabsEl      = document.getElementById('context-tabs');
+    const profileNameEl      = document.getElementById('profile-name');
+    const profileEmojiEl     = document.getElementById('profile-emoji');
+    const btnSaveProfile     = document.getElementById('btn-save-profile');
+    const profileSaveStatus  = document.getElementById('profile-save-status');
     let activeContextTab = 'shared'; // 'shared' or model id
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -608,14 +622,18 @@
     // ── Load models & context ─────────────────────────────────────────────────
     async function init() {
       try {
-        const [modelsRes, contextRes] = await Promise.all([
+        const [modelsRes, contextRes, profileRes] = await Promise.all([
           fetch('/api/models'),
           fetch('/api/user-context'),
+          fetch('/api/profile'),
         ]);
         models = await modelsRes.json();
         const ctxData = await contextRes.json();
+        profile = await profileRes.json();
         sharedContext = ctxData.content || '';
         contextTextarea.value = sharedContext;
+        profileNameEl.value = profile.name;
+        profileEmojiEl.value = profile.emoji;
         renderModelToggles();
         renderContextTabs();
       } catch (err) {
@@ -643,7 +661,7 @@
           <span>${time}</span>
           <span class="round-cost" id="round-cost-${roundIndex}"></span>
         </div>
-        <div class="user-label">User 🌟</div>
+        <div class="user-label">${escapeHtml(userLabel())}</div>
         <div class="user-message">${escapeHtml(round.message)}</div>
         <div class="responses-grid" id="responses-${roundIndex}"></div>
       `;
@@ -749,7 +767,7 @@
     // ── Build transcript string (all completed rounds, excluding current) ─────
     function buildTranscriptText(completedRounds) {
       return completedRounds.map(round => {
-        let text = `[User] ${round.message}`;
+        let text = `[${userLabel()}] ${round.message}`;
         round.responses.forEach(r => {
           if (!r.error && r.text) {
             text += `\n\n[${r.nickname} ${r.emoji}] ${r.text}`;
@@ -840,6 +858,28 @@
     }
 
     // ── Settings ──────────────────────────────────────────────────────────────
+    async function saveProfile() {
+      const name = profileNameEl.value.trim() || 'User';
+      const emoji = profileEmojiEl.value.trim() || '🌟';
+      profileSaveStatus.textContent = 'Saving…';
+      try {
+        const res = await fetch('/api/profile', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, emoji }),
+        });
+        if (res.ok) {
+          profile = { name, emoji };
+          profileSaveStatus.textContent = 'Saved ✓';
+          setTimeout(() => { profileSaveStatus.textContent = ''; }, 2000);
+        } else {
+          profileSaveStatus.textContent = 'Save failed.';
+        }
+      } catch {
+        profileSaveStatus.textContent = 'Save failed.';
+      }
+    }
+
     async function saveContext() {
       // Sync textarea into cache first
       if (activeContextTab === 'shared') {
@@ -928,6 +968,7 @@
       switchContextTab('shared').catch(console.error);
     });
 
+    btnSaveProfile.addEventListener('click', saveProfile);
     btnSaveContext.addEventListener('click', saveContext);
     btnExport.addEventListener('click', exportChat);
     btnNew.addEventListener('click', newSession);
