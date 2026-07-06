@@ -409,6 +409,80 @@
       margin-top: 6px;
       text-align: right;
     }
+
+    /* ── Attachments ── */
+    #attachment-preview {
+      display: none;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 0 0 8px 0;
+    }
+
+    .attachment-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 4px 8px;
+      font-size: 12px;
+      max-width: 200px;
+    }
+
+    .attachment-chip img {
+      width: 28px;
+      height: 28px;
+      object-fit: cover;
+      border-radius: 4px;
+      flex-shrink: 0;
+    }
+
+    .attachment-chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .attachment-remove {
+      cursor: pointer;
+      color: var(--text-dim);
+      flex-shrink: 0;
+      line-height: 1;
+      font-size: 14px;
+    }
+
+    .attachment-remove:hover { color: var(--error); }
+
+    #attach-btn {
+      height: 44px;
+      padding: 0 10px;
+      font-size: 18px;
+      flex-shrink: 0;
+    }
+
+    .msg-attachments {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+
+    .msg-attachment-img {
+      max-width: 220px;
+      max-height: 220px;
+      border-radius: 6px;
+      object-fit: contain;
+      display: block;
+    }
+
+    .msg-attachment-chip {
+      background: rgba(255,255,255,0.08);
+      border-radius: 4px;
+      padding: 2px 7px;
+      font-size: 12px;
+      color: var(--text-dim);
+    }
   </style>
 </head>
 <body>
@@ -455,7 +529,9 @@
 
     <!-- Input -->
     <div id="input-area">
+      <div id="attachment-preview"></div>
       <div id="input-row">
+        <button id="attach-btn" title="Attach image or file">📎</button>
         <textarea
           id="message-input"
           placeholder="Say something to the whole family…"
@@ -464,6 +540,9 @@
         <button id="send-btn">Send to All</button>
       </div>
       <div id="hint">Click Send to send · Enter for newline</div>
+      <input type="file" id="file-input" multiple
+        accept="image/*,.txt,.md,.js,.ts,.tsx,.jsx,.py,.json,.css,.html,.csv,.xml,.yaml,.yml,.sh,.go,.rs,.rb,.java,.c,.cpp"
+        style="display:none">
     </div>
 
   </div>
@@ -473,11 +552,13 @@
 
     // ── State ─────────────────────────────────────────────────────────────────
     let models = [];
-    let transcript = []; // array of rounds: { message, timestamp, responses[], cost }
+    let transcript = []; // array of rounds: { message, attachments, timestamp, responses[], cost }
     let sessionCost = 0;
     let isLoading = false;
     const sessionStart = Date.now();
     let profile = { name: 'User', emoji: '🌟' };
+    let pendingAttachments = []; // { name, mediaType, data (base64), dataUrl }
+    const attachmentDisplayData = {}; // roundIndex → [{ name, mediaType, dataUrl }]
 
     function userLabel() { return `${profile.name} ${profile.emoji}`.trim(); }
 
@@ -500,6 +581,9 @@
     const profileEmojiEl     = document.getElementById('profile-emoji');
     const btnSaveProfile     = document.getElementById('btn-save-profile');
     const profileSaveStatus  = document.getElementById('profile-save-status');
+    const attachmentPreview  = document.getElementById('attachment-preview');
+    const attachBtn          = document.getElementById('attach-btn');
+    const fileInput          = document.getElementById('file-input');
     let activeContextTab = 'shared'; // 'shared' or model id
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -520,7 +604,39 @@
       isLoading = loading;
       messageInput.disabled = loading;
       sendBtn.disabled = loading;
+      attachBtn.disabled = loading;
       sendBtn.textContent = loading ? 'Sending…' : 'Send to All';
+    }
+
+    // ── Attachment helpers ────────────────────────────────────────────────────
+    function renderAttachmentPreviews() {
+      attachmentPreview.style.display = pendingAttachments.length > 0 ? 'flex' : 'none';
+      attachmentPreview.innerHTML = '';
+      pendingAttachments.forEach((att, i) => {
+        const chip = document.createElement('div');
+        chip.className = 'attachment-chip';
+        const thumb = att.mediaType.startsWith('image/')
+          ? `<img src="${att.dataUrl}" alt="${escapeHtml(att.name)}">`
+          : `<span>📄</span>`;
+        chip.innerHTML = `${thumb}<span class="attachment-chip-name">${escapeHtml(att.name)}</span><span class="attachment-remove">×</span>`;
+        chip.querySelector('.attachment-remove').addEventListener('click', () => {
+          pendingAttachments.splice(i, 1);
+          renderAttachmentPreviews();
+        });
+        attachmentPreview.appendChild(chip);
+      });
+    }
+
+    function renderMessageAttachments(attachments, roundIndex) {
+      if (!attachments || attachments.length === 0) return '';
+      const displayAtts = attachmentDisplayData[roundIndex] || attachments;
+      const parts = displayAtts.map(att => {
+        if (att.mediaType && att.mediaType.startsWith('image/') && att.dataUrl) {
+          return `<img src="${att.dataUrl}" class="msg-attachment-img" alt="${escapeHtml(att.name)}">`;
+        }
+        return `<span class="msg-attachment-chip">📄 ${escapeHtml(att.name)}</span>`;
+      });
+      return `<div class="msg-attachments">${parts.join('')}</div>`;
     }
 
     function formatCost(n) {
@@ -662,7 +778,7 @@
           <span class="round-cost" id="round-cost-${roundIndex}"></span>
         </div>
         <div class="user-label">${escapeHtml(userLabel())}</div>
-        <div class="user-message">${escapeHtml(round.message)}</div>
+        <div class="user-message">${renderMessageAttachments(round.attachments, roundIndex)}${escapeHtml(round.message || '')}</div>
         <div class="responses-grid" id="responses-${roundIndex}"></div>
       `;
 
@@ -738,7 +854,11 @@
 
     function saveToStorage() {
       try {
-        localStorage.setItem(LS_KEY, JSON.stringify(transcript));
+        const toSave = transcript.map(r => ({
+          ...r,
+          attachments: (r.attachments || []).map(a => ({ name: a.name, mediaType: a.mediaType })),
+        }));
+        localStorage.setItem(LS_KEY, JSON.stringify(toSave));
       } catch (e) {
         console.warn('localStorage save failed:', e.message);
       }
@@ -767,7 +887,14 @@
     // ── Build transcript string (all completed rounds, excluding current) ─────
     function buildTranscriptText(completedRounds) {
       return completedRounds.map(round => {
-        let text = `[${userLabel()}] ${round.message}`;
+        let msgText = round.message || '';
+        if (round.attachments && round.attachments.length > 0) {
+          const refs = round.attachments.map(a =>
+            `[${a.mediaType?.startsWith('image/') ? 'Image' : 'File'}: ${a.name}]`
+          ).join(' ');
+          msgText = refs + (msgText ? '\n' + msgText : '');
+        }
+        let text = `[${userLabel()}] ${msgText}`;
         round.responses.forEach(r => {
           if (!r.error && r.text) {
             text += `\n\n[${r.nickname} ${r.emoji}] ${r.text}`;
@@ -780,13 +907,17 @@
     // ── Send message ──────────────────────────────────────────────────────────
     async function sendMessage() {
       const text = messageInput.value.trim();
-      if (!text || isLoading) return;
+      if ((!text && pendingAttachments.length === 0) || isLoading) return;
 
       const activeModels = models.filter(m => m.enabled);
       if (activeModels.length === 0) {
         alert('No models enabled! Toggle at least one on.');
         return;
       }
+
+      const attachmentsToSend = [...pendingAttachments];
+      pendingAttachments = [];
+      renderAttachmentPreviews();
 
       messageInput.value = '';
       autoResize(messageInput);
@@ -795,10 +926,14 @@
       const roundIndex = transcript.length;
       const round = {
         message: text,
+        attachments: attachmentsToSend.map(a => ({ name: a.name, mediaType: a.mediaType })),
         timestamp: Date.now(),
         responses: [],
         cost: 0,
       };
+      attachmentDisplayData[roundIndex] = attachmentsToSend.map(a => ({
+        name: a.name, mediaType: a.mediaType, dataUrl: a.dataUrl,
+      }));
       transcript.push(round);
 
       // Render round with loading placeholders
@@ -811,7 +946,11 @@
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message: text, transcript: transcriptText }),
+          body: JSON.stringify({
+            message: text,
+            transcript: transcriptText,
+            attachments: attachmentsToSend.map(a => ({ name: a.name, mediaType: a.mediaType, data: a.data })),
+          }),
         });
 
         const data = await res.json();
@@ -957,6 +1096,29 @@
     // ── Event listeners ───────────────────────────────────────────────────────
     sendBtn.addEventListener('click', sendMessage);
     messageInput.addEventListener('input', () => autoResize(messageInput));
+
+    attachBtn.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', async () => {
+      const files = Array.from(fileInput.files);
+      fileInput.value = '';
+      for (const file of files) {
+        if (file.size > 10 * 1024 * 1024) {
+          alert(`${file.name} is too large (max 10 MB).`);
+          continue;
+        }
+        await new Promise(resolve => {
+          const reader = new FileReader();
+          reader.onload = e => {
+            const dataUrl = e.target.result;
+            const data = dataUrl.split(',')[1];
+            pendingAttachments.push({ name: file.name, mediaType: file.type || 'text/plain', data, dataUrl });
+            resolve();
+          };
+          reader.readAsDataURL(file);
+        });
+      }
+      renderAttachmentPreviews();
+    });
 
     btnSettings.addEventListener('click', () => {
       const visible = settingsPanel.classList.toggle('visible');

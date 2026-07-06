@@ -15,7 +15,7 @@ if (!fs.existsSync(CONTEXTS_DIR)) fs.mkdirSync(CONTEXTS_DIR);
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-app.use(express.json({ limit: '2mb' }));
+app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ── Model config ──────────────────────────────────────────────────────────────
@@ -143,9 +143,9 @@ function calcCost(model, inputTokens, outputTokens) {
 // ── Main chat endpoint ────────────────────────────────────────────────────────
 
 app.post('/api/chat', async (req, res) => {
-  const { message, transcript } = req.body;
-  if (!message || typeof message !== 'string') {
-    return res.status(400).json({ error: 'message is required' });
+  const { message, transcript, attachments } = req.body;
+  if (!message && !(attachments && attachments.length > 0)) {
+    return res.status(400).json({ error: 'message or attachments required' });
   }
 
   const models = loadModels();
@@ -159,8 +159,30 @@ app.post('/api/chat', async (req, res) => {
 
   const userLabel = `${profile.name} ${profile.emoji}`.trim();
 
+  // Text file attachments: prepend file content to the current message
+  let augmentedMessage = message || '';
+  const textAttachments = (attachments || []).filter(a => !a.mediaType?.startsWith('image/'));
+  for (const att of textAttachments) {
+    try {
+      const fileText = Buffer.from(att.data, 'base64').toString('utf8');
+      augmentedMessage = `[File: ${att.name}]\n${fileText}\n\n${augmentedMessage}`;
+    } catch {}
+  }
+
   // Build full transcript string for context
-  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[${userLabel}] ${message}`;
+  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[${userLabel}] ${augmentedMessage}`;
+
+  // Image attachments become content blocks
+  const imageAttachments = (attachments || []).filter(a => a.mediaType?.startsWith('image/'));
+  const msgContent = imageAttachments.length > 0
+    ? [
+        ...imageAttachments.map(att => ({
+          type: 'image',
+          source: { type: 'base64', media_type: att.mediaType, data: att.data },
+        })),
+        { type: 'text', text: transcriptText },
+      ]
+    : transcriptText;
 
   // Stop sequences: halt generation if model starts a new transcript entry
   // Use double-newline prefix to match the transcript format and avoid
@@ -182,7 +204,7 @@ app.post('/api/chat', async (req, res) => {
         model: model.id,
         max_tokens: 1024,
         system: systemPrompt,
-        messages: [{ role: 'user', content: transcriptText }],
+        messages: [{ role: 'user', content: msgContent }],
         stop_sequences: stopSequences,
       }, { signal: controller.signal });
 

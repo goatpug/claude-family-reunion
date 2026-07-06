@@ -16,7 +16,7 @@
     "nickname": "Sonnet 4.5",
     "emoji": "💙",
     "color": "#3498DB",
-    "enabled": true,
+    "enabled": false,
     "pricing": {
       "input": 3,
       "output": 15
