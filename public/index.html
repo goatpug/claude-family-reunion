@@ -756,10 +756,15 @@
         console.error('Init failed:', err);
       }
 
-      // Restore transcript from localStorage if present
-      const saved = loadFromStorage();
-      if (saved && saved.length > 0) {
-        restoreTranscript(saved);
+      // Restore transcript from server
+      try {
+        const transcriptRes = await fetch('/api/transcript');
+        const saved = await transcriptRes.json();
+        if (saved && saved.length > 0) {
+          restoreTranscript(saved);
+        }
+      } catch (err) {
+        console.warn('Could not restore transcript:', err.message);
       }
     }
 
@@ -849,29 +854,7 @@
       return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
-    // ── localStorage persistence ──────────────────────────────────────────────
-    const LS_KEY = 'family-reunion-transcript';
-
-    function saveToStorage() {
-      try {
-        const toSave = transcript.map(r => ({
-          ...r,
-          attachments: (r.attachments || []).map(a => ({ name: a.name, mediaType: a.mediaType })),
-        }));
-        localStorage.setItem(LS_KEY, JSON.stringify(toSave));
-      } catch (e) {
-        console.warn('localStorage save failed:', e.message);
-      }
-    }
-
-    function loadFromStorage() {
-      try {
-        const raw = localStorage.getItem(LS_KEY);
-        return raw ? JSON.parse(raw) : null;
-      } catch {
-        return null;
-      }
-    }
+    // ── Transcript persistence (server-side) ─────────────────────────────────
 
     function restoreTranscript(saved) {
       transcript = saved;
@@ -978,7 +961,6 @@
           sessionCost += roundCost;
           sessionCostEl.textContent = formatCost(sessionCost);
           updateRoundCost(roundIndex, roundCost);
-          saveToStorage();
         }
       } catch (err) {
         activeModels.forEach(m => {
@@ -1083,14 +1065,18 @@
     }
 
     // ── New session ───────────────────────────────────────────────────────────
-    function newSession() {
+    async function newSession() {
       if (transcript.length > 0 && !confirm('Clear this session and start fresh?')) return;
       transcript = [];
       sessionCost = 0;
       sessionCostEl.textContent = '$0.00';
       chatArea.querySelectorAll('.round').forEach(r => r.remove());
       showEmpty(true);
-      localStorage.removeItem(LS_KEY);
+      try {
+        await fetch('/api/transcript', { method: 'DELETE' });
+      } catch (e) {
+        console.warn('Failed to clear server transcript:', e.message);
+      }
     }
 
     // ── Event listeners ───────────────────────────────────────────────────────

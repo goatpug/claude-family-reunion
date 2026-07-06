@@ -9,11 +9,76 @@ const PORT = 3001;
 const MODELS_FILE   = path.join(__dirname, 'models.json');
 const CONTEXT_FILE  = path.join(__dirname, 'user-context.txt');
 const CONTEXTS_DIR  = path.join(__dirname, 'contexts');
-const PROFILE_FILE  = path.join(__dirname, 'user-profile.json');
+const PROFILE_FILE      = path.join(__dirname, 'user-profile.json');
+const TRANSCRIPT_FILE   = path.join(__dirname, 'transcript.json');
 
 if (!fs.existsSync(CONTEXTS_DIR)) fs.mkdirSync(CONTEXTS_DIR);
 
 const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ── MCP servers ──────────────────────────────────────────────────────────────
+
+const MCP_SERVERS = [
+  { name: 'claude_memory', transport: 'http', url: 'https://claude-memory.sharongoat.workers.dev/mcp', apiKey: process.env.MEMORY_API_KEY },
+];
+
+const mcpClients = {};
+let mcpTools = [];
+const toolOwner = {};
+
+async function initMcpServer(def) {
+  if (mcpClients[def.name]) return;
+  try {
+    const { Client } = await import('@modelcontextprotocol/sdk/client/index.js');
+    let transport;
+    if (def.transport === 'sse') {
+      const { SSEClientTransport } = await import('@modelcontextprotocol/sdk/client/sse.js');
+      transport = new SSEClientTransport(new URL(def.url));
+    } else {
+      const { StreamableHTTPClientTransport } = await import('@modelcontextprotocol/sdk/client/streamableHttp.js');
+      const opts = def.apiKey ? { requestInit: { headers: { Authorization: `Bearer ${def.apiKey}` } } } : {};
+      transport = new StreamableHTTPClientTransport(new URL(def.url), opts);
+    }
+    const c = new Client({ name: 'claude-family-reunion', version: '1.0.0' }, { capabilities: {} });
+    await c.connect(transport);
+    const { tools } = await c.listTools();
+    for (const t of tools) {
+      mcpTools.push({ name: t.name, description: t.description, input_schema: t.inputSchema });
+      toolOwner[t.name] = def.name;
+    }
+    mcpClients[def.name] = c;
+    console.log(`MCP: connected to ${def.name} — ${tools.length} tools`);
+  } catch (err) {
+    console.error(`MCP init failed (${def.name}): ${err.message}`);
+  }
+}
+
+async function initMcp() {
+  await Promise.all(MCP_SERVERS.map(initMcpServer));
+}
+
+async function callMcpTool(name, input) {
+  const serverName = toolOwner[name];
+  const exec = async () => {
+    const c = mcpClients[serverName];
+    if (!c) throw new Error(`No MCP client for tool: ${name}`);
+    const r = await c.callTool({ name, arguments: input });
+    return (r.content || []).map(b => b.type === 'text' ? b.text : JSON.stringify(b)).join('');
+  };
+  try {
+    return await exec();
+  } catch (e) {
+    if (e.code === -32602 || e.code === -32600 || e.code === -32000) {
+      const def = MCP_SERVERS.find(s => s.name === serverName);
+      if (!def) throw e;
+      delete mcpClients[serverName];
+      mcpTools = mcpTools.filter(t => toolOwner[t.name] !== serverName);
+      await initMcpServer(def);
+      return await exec();
+    }
+    throw e;
+  }
+}
 
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -57,6 +122,25 @@ function loadProfile() {
 function saveProfile(profile) {
   fs.writeFileSync(PROFILE_FILE, JSON.stringify(profile, null, 2), 'utf8');
 }
+
+function loadTranscript() {
+  if (!fs.existsSync(TRANSCRIPT_FILE)) return [];
+  try { return JSON.parse(fs.readFileSync(TRANSCRIPT_FILE, 'utf8')); }
+  catch { return []; }
+}
+
+function saveTranscript(transcript) {
+  fs.writeFileSync(TRANSCRIPT_FILE, JSON.stringify(transcript, null, 2), 'utf8');
+}
+
+app.get('/api/transcript', (req, res) => {
+  res.json(loadTranscript());
+});
+
+app.delete('/api/transcript', (req, res) => {
+  saveTranscript([]);
+  res.json({ ok: true });
+});
 
 app.get('/api/models', (req, res) => {
   res.json(loadModels());
@@ -192,7 +276,9 @@ app.post('/api/chat', async (req, res) => {
     stopSequences.push(`\n\n[${m.nickname}`);
   });
 
-  // Fire all model requests in parallel
+  await initMcp();
+
+  // Fire all model requests in parallel; each runs its own tool-use loop
   const requests = activeModels.map(async model => {
     const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile);
 
@@ -200,19 +286,57 @@ app.post('/api/chat', async (req, res) => {
     const timeout = setTimeout(() => controller.abort(), 120_000);
 
     try {
-      const response = await client.messages.create({
-        model: model.id,
-        max_tokens: 1024,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: msgContent }],
-        stop_sequences: stopSequences,
-      }, { signal: controller.signal });
+      let apiMessages = [{ role: 'user', content: msgContent }];
+      const allTexts = [];
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+
+      while (true) {
+        const params = {
+          model: model.id,
+          max_tokens: 1024,
+          system: systemPrompt,
+          messages: apiMessages,
+          stop_sequences: stopSequences,
+        };
+        if (mcpTools.length > 0) params.tools = mcpTools;
+
+        const response = await client.messages.create(params, { signal: controller.signal });
+
+        totalInputTokens  += response.usage?.input_tokens  || 0;
+        totalOutputTokens += response.usage?.output_tokens || 0;
+
+        const roundText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
+        if (roundText) allTexts.push(roundText);
+
+        if (response.stop_reason !== 'tool_use') break;
+
+        const assistantMsg = { role: 'assistant', content: response.content };
+        apiMessages = [...apiMessages, assistantMsg];
+
+        const toolResults = await Promise.all(
+          response.content
+            .filter(b => b.type === 'tool_use')
+            .map(async toolUse => {
+              let resultText;
+              try {
+                resultText = await callMcpTool(toolUse.name, toolUse.input);
+              } catch (e) {
+                resultText = `Tool error: ${e.message}`;
+              }
+              console.log(`[${model.nickname}] ${toolUse.name}(${JSON.stringify(toolUse.input)}) → ${resultText}`);
+              return { type: 'tool_result', tool_use_id: toolUse.id, content: resultText };
+            })
+        );
+
+        apiMessages = [...apiMessages, { role: 'user', content: toolResults }];
+      }
 
       clearTimeout(timeout);
 
-      const text = response.content[0]?.text || '';
-      const inputTokens = response.usage?.input_tokens || 0;
-      const outputTokens = response.usage?.output_tokens || 0;
+      const text = allTexts.join('\n\n');
+      const inputTokens  = totalInputTokens;
+      const outputTokens = totalOutputTokens;
       const cost = calcCost(model, inputTokens, outputTokens);
 
       return {
@@ -263,6 +387,18 @@ app.post('/api/chat', async (req, res) => {
     cost: 0,
     error: r.reason?.message || 'Request failed',
   });
+
+  const totalCost = responses.reduce((sum, r) => sum + (r.cost || 0), 0);
+  const round = {
+    message: message || '',
+    attachments: (attachments || []).map(a => ({ name: a.name, mediaType: a.mediaType })),
+    timestamp: Date.now(),
+    responses,
+    cost: totalCost,
+  };
+  const saved = loadTranscript();
+  saved.push(round);
+  saveTranscript(saved);
 
   res.json({ responses });
 });
