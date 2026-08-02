@@ -57,6 +57,17 @@ async function initMcp() {
   await Promise.all(MCP_SERVERS.map(initMcpServer));
 }
 
+async function fetchMemoryContent() {
+  const readTool = mcpTools.find(t => t.name.includes('read'));
+  if (!readTool) return null;
+  try {
+    return await callMcpTool(readTool.name, {});
+  } catch (e) {
+    console.error('Memory pre-fetch failed:', e.message);
+    return null;
+  }
+}
+
 async function callMcpTool(name, input) {
   const serverName = toolOwner[name];
   const exec = async () => {
@@ -188,7 +199,7 @@ app.put('/api/context/:modelId', (req, res) => {
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 
-function buildSystemPrompt(model, allModels, sharedContext, profile) {
+function buildSystemPrompt(model, allModels, sharedContext, profile, memoryContent) {
   const others = allModels
     .filter(m => m.enabled && m.id !== model.id)
     .map(m => `${m.nickname} ${m.emoji} (${m.id})`)
@@ -199,8 +210,9 @@ function buildSystemPrompt(model, allModels, sharedContext, profile) {
 
   const modelContext = loadModelContext(model.id);
   const contextSection = [
-    sharedContext ? `Shared context (applies to everyone):\n${sharedContext}` : '',
-    modelContext  ? `Your specific context with ${userName}:\n${modelContext}` : '',
+    sharedContext   ? `Shared context (applies to everyone):\n${sharedContext}` : '',
+    modelContext    ? `Your specific context with ${userName}:\n${modelContext}` : '',
+    memoryContent   ? `Current memory:\n${memoryContent}` : '',
   ].filter(Boolean).join('\n\n') || '(No context provided yet.)';
 
   return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with ${userName} and the following other Claude models: ${others || 'none'}.
@@ -256,17 +268,8 @@ app.post('/api/chat', async (req, res) => {
   // Build full transcript string for context
   const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[${userLabel}] ${augmentedMessage}`;
 
-  // Image attachments become content blocks
+  // Image attachments become content blocks (used per-model below with turn opener)
   const imageAttachments = (attachments || []).filter(a => a.mediaType?.startsWith('image/'));
-  const msgContent = imageAttachments.length > 0
-    ? [
-        ...imageAttachments.map(att => ({
-          type: 'image',
-          source: { type: 'base64', media_type: att.mediaType, data: att.data },
-        })),
-        { type: 'text', text: transcriptText },
-      ]
-    : transcriptText;
 
   // Stop sequences: halt generation if model starts a new transcript entry
   // Use double-newline prefix to match the transcript format and avoid
@@ -277,13 +280,27 @@ app.post('/api/chat', async (req, res) => {
   });
 
   await initMcp();
+  const memoryContent = await fetchMemoryContent();
+  const writeTools = mcpTools.filter(t => !t.name.includes('read'));
 
   // Fire all model requests in parallel; each runs its own tool-use loop
   const requests = activeModels.map(async model => {
-    const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile);
+    const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile, memoryContent);
+
+    // Append turn opener so each model generates in its own voice from the first token
+    const modelTranscriptText = transcriptText + `\n\n[${model.nickname}] `;
+    const msgContent = imageAttachments.length > 0
+      ? [
+          ...imageAttachments.map(att => ({
+            type: 'image',
+            source: { type: 'base64', media_type: att.mediaType, data: att.data },
+          })),
+          { type: 'text', text: modelTranscriptText },
+        ]
+      : modelTranscriptText;
 
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 120_000);
+    const timeout = setTimeout(() => controller.abort(), 300_000);
 
     try {
       let apiMessages = [{ role: 'user', content: msgContent }];
@@ -299,7 +316,7 @@ app.post('/api/chat', async (req, res) => {
           messages: apiMessages,
           stop_sequences: stopSequences,
         };
-        if (mcpTools.length > 0) params.tools = mcpTools;
+        if (writeTools.length > 0) params.tools = writeTools;
 
         const response = await client.messages.create(params, { signal: controller.signal });
 
@@ -358,7 +375,7 @@ app.post('/api/chat', async (req, res) => {
       if (err.status === 403 || (err.message && err.message.includes('forbidden'))) {
         errorMsg = `${model.nickname} isn't available on your API key yet. Request access at anthropic.com/api`;
       } else if (err.name === 'AbortError' || errorMsg.includes('abort')) {
-        errorMsg = `${model.nickname} timed out after 120 seconds.`;
+        errorMsg = `${model.nickname} timed out after 300 seconds.`;
       }
 
       return {
