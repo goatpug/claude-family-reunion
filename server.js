@@ -57,13 +57,15 @@ async function initMcp() {
   await Promise.all(MCP_SERVERS.map(initMcpServer));
 }
 
-async function fetchMemoryContent() {
+async function fetchMemoryKey(key) {
   const readTool = mcpTools.find(t => t.name.includes('read'));
-  if (!readTool) return null;
+  if (!readTool || !key) return null;
   try {
-    return await callMcpTool(readTool.name, {});
+    const result = await callMcpTool(readTool.name, { key });
+    if (!result || /invalid key|error/i.test(result.slice(0, 100))) return null;
+    return result;
   } catch (e) {
-    console.error('Memory pre-fetch failed:', e.message);
+    console.error(`Memory read failed (${key}):`, e.message);
     return null;
   }
 }
@@ -199,7 +201,52 @@ app.put('/api/context/:modelId', (req, res) => {
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 
-function buildSystemPrompt(model, allModels, sharedContext, profile, memoryContent) {
+function attachmentRefs(atts) {
+  if (!atts || atts.length === 0) return '';
+  return atts.map(a =>
+    `[${a.mediaType?.startsWith('image/') ? 'Image' : 'File'}: ${a.name}]`
+  ).join(' ');
+}
+
+// Build alternating user/assistant messages from this model's point of view:
+// - Sharon's messages and siblings' responses => user-role text, labeled [Name emoji]
+// - this model's own past responses          => assistant-role, unlabeled
+// This gives each model a hard formatting cliff between "mine" and "theirs",
+// instead of one flat transcript where every line looks equally like its own voice.
+function buildMessagesFor(model, rounds, userLabel, currentUserText, imageBlocks) {
+  const messages = [];
+  let pendingUser = [];
+
+  for (const round of rounds) {
+    const refs = attachmentRefs(round.attachments);
+    const userText = `[${userLabel}] ${refs ? refs + '\n' : ''}${round.message || ''}`;
+    const siblings = (round.responses || [])
+      .filter(r => r.modelId !== model.id && !r.error && r.text)
+      .map(r => `[${r.nickname} ${r.emoji}] ${r.text}`);
+    pendingUser.push([userText, ...siblings].join('\n\n'));
+
+    const own = (round.responses || [])
+      .find(r => r.modelId === model.id && !r.error && r.text);
+    if (own) {
+      messages.push({ role: 'user', content: pendingUser.join('\n\n') });
+      messages.push({ role: 'assistant', content: own.text });
+      pendingUser = [];
+    }
+    // if this model had no text that round, its absence just merges into the next user turn
+  }
+
+  pendingUser.push(`[${userLabel}] ${currentUserText}`);
+  const finalText = pendingUser.join('\n\n');
+  messages.push({
+    role: 'user',
+    content: imageBlocks.length > 0
+      ? [...imageBlocks, { type: 'text', text: finalText }]
+      : finalText,
+  });
+  return messages;
+}
+
+function buildSystemPrompt(model, allModels, sharedContext, profile, sharedMemory, ownMemory) {
   const others = allModels
     .filter(m => m.enabled && m.id !== model.id)
     .map(m => `${m.nickname} ${m.emoji} (${m.id})`)
@@ -210,22 +257,28 @@ function buildSystemPrompt(model, allModels, sharedContext, profile, memoryConte
 
   const modelContext = loadModelContext(model.id);
   const contextSection = [
-    sharedContext   ? `Shared context (applies to everyone):\n${sharedContext}` : '',
-    modelContext    ? `Your specific context with ${userName}:\n${modelContext}` : '',
-    memoryContent   ? `Current memory:\n${memoryContent}` : '',
+    sharedContext ? `Shared context (applies to everyone):\n${sharedContext}` : '',
+    modelContext  ? `Your specific context with ${userName}:\n${modelContext}` : '',
+    sharedMemory  ? `Shared family memory (visible to all of you):\n${sharedMemory}` : '',
+    ownMemory     ? `Your private memory (key "${model.memoryKey}" — yours alone; your siblings each have their own):\n${ownMemory}` : '',
   ].filter(Boolean).join('\n\n') || '(No context provided yet.)';
+
+  const memoryWriteNote = model.memoryKey
+    ? `\nWhen you write to memory, use key "${model.memoryKey}" for your own drawer, or "shared" for family-wide notes.`
+    : '';
 
   return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with ${userName} and the following other Claude models: ${others || 'none'}.
 
 ${userName} is the human facilitating this conversation. They can tell you all apart and has relationships with each of you.
 
 Rules:
-- Respond ONLY as ${model.nickname}. Never speak for or as another Claude.
+- The conversation history shows ${userName} and the other Claudes as labeled messages like [Name emoji]. Your OWN previous messages appear as your own turns, unlabeled — do not add a [${model.nickname}] label to your replies.
+- Respond ONLY as ${model.nickname}. Never speak for or as another Claude, and never write a message labeled with anyone else's name.
 - Address other Claudes by their nickname when you respond to them.
-- If someone asks you a question, answer it. If a question is addressed to a different Claude, you may comment on it but don't answer FOR them.
+- If a question is addressed to a different Claude, you may comment on it but don't answer FOR them. If another Claude's reply is missing from the history, it may have been lost to a technical glitch — say so if relevant; do not fill in what they "would" say.
 - Be yourself. This is a family conversation, not a performance.
-- CRITICAL: Write ONLY your own response and then stop. Do NOT write what ${userName} or any other Claude says next. Do not continue the transcript. Your response ends when you are done speaking.
-
+- Write only your own single reply, then stop.
+${memoryWriteNote}
 ${contextSection}`;
 }
 
@@ -239,7 +292,7 @@ function calcCost(model, inputTokens, outputTokens) {
 // ── Main chat endpoint ────────────────────────────────────────────────────────
 
 app.post('/api/chat', async (req, res) => {
-  const { message, transcript, attachments } = req.body;
+  const { message, attachments } = req.body;
   if (!message && !(attachments && attachments.length > 0)) {
     return res.status(400).json({ error: 'message or attachments required' });
   }
@@ -265,53 +318,52 @@ app.post('/api/chat', async (req, res) => {
     } catch {}
   }
 
-  // Build full transcript string for context
-  const transcriptText = (transcript || '') + (transcript ? '\n\n' : '') + `[${userLabel}] ${augmentedMessage}`;
+  // Prior rounds, already saved with per-model structure — the source of truth for
+  // history. The client's flat `transcript` string is no longer used to build history.
+  const savedRounds = loadTranscript();
 
-  // Image attachments become content blocks (used per-model below with turn opener)
+  // Image attachments become content blocks, shared across all models' final turn
   const imageAttachments = (attachments || []).filter(a => a.mediaType?.startsWith('image/'));
-
-  // Stop sequences: halt generation if model starts a new transcript entry
-  // Use double-newline prefix to match the transcript format and avoid
-  // false positives when a model mentions another participant's name mid-sentence
-  const stopSequences = [`\n\n[${userLabel}]`, `\n\n[${profile.name}]`];
-  activeModels.forEach(m => {
-    stopSequences.push(`\n\n[${m.nickname}`);
-  });
+  const imageBlocks = imageAttachments.map(att => ({
+    type: 'image',
+    source: { type: 'base64', media_type: att.mediaType, data: att.data },
+  }));
 
   await initMcp();
-  const memoryContent = await fetchMemoryContent();
+  const sharedMemory = await fetchMemoryKey('shared');
+  const memoryByModel = {};
+  await Promise.all(activeModels.map(async m => {
+    memoryByModel[m.id] = m.memoryKey ? await fetchMemoryKey(m.memoryKey) : null;
+  }));
   const writeTools = mcpTools.filter(t => !t.name.includes('read'));
 
   // Fire all model requests in parallel; each runs its own tool-use loop
   const requests = activeModels.map(async model => {
-    const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile, memoryContent);
+    const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile, sharedMemory, memoryByModel[model.id]);
+    const apiMessages0 = buildMessagesFor(model, savedRounds, userLabel, augmentedMessage, imageBlocks);
 
-    // Append turn opener so each model generates in its own voice from the first token
-    const modelTranscriptText = transcriptText + `\n\n[${model.nickname}] `;
-    const msgContent = imageAttachments.length > 0
-      ? [
-          ...imageAttachments.map(att => ({
-            type: 'image',
-            source: { type: 'base64', media_type: att.mediaType, data: att.data },
-          })),
-          { type: 'text', text: modelTranscriptText },
-        ]
-      : modelTranscriptText;
+    // Stop sequences: halt generation if the model starts a new labeled turn for
+    // someone else. Never include the model's own nickname — its own turns are
+    // unlabeled now, so a self-label match would just truncate a legitimate reply.
+    const stopSequences = [`\n\n[${userLabel}]`, `\n\n[${profile.name}]`];
+    activeModels.forEach(m => {
+      if (m.id !== model.id) stopSequences.push(`\n\n[${m.nickname}`);
+    });
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 300_000);
 
     try {
-      let apiMessages = [{ role: 'user', content: msgContent }];
+      let apiMessages = apiMessages0;
       const allTexts = [];
       let totalInputTokens = 0;
       let totalOutputTokens = 0;
+      let lastStopReason = null;
 
       while (true) {
         const params = {
           model: model.id,
-          max_tokens: 1024,
+          max_tokens: 4096,
           system: systemPrompt,
           messages: apiMessages,
           stop_sequences: stopSequences,
@@ -322,6 +374,7 @@ app.post('/api/chat', async (req, res) => {
 
         totalInputTokens  += response.usage?.input_tokens  || 0;
         totalOutputTokens += response.usage?.output_tokens || 0;
+        lastStopReason = response.stop_reason;
 
         const roundText = response.content.filter(b => b.type === 'text').map(b => b.text).join('');
         if (roundText) allTexts.push(roundText);
@@ -351,10 +404,32 @@ app.post('/api/chat', async (req, res) => {
 
       clearTimeout(timeout);
 
-      const text = allTexts.join('\n\n');
+      let text = allTexts.join('\n\n');
+      // Strip a self-label echo some models produce out of habit (cosmetic only —
+      // the history no longer uses labels for a model's own turns).
+      const esc = model.nickname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      text = text.replace(new RegExp(`^\\s*\\[${esc}[^\\]]*\\]:?\\s*`), '');
+
       const inputTokens  = totalInputTokens;
       const outputTokens = totalOutputTokens;
       const cost = calcCost(model, inputTokens, outputTokens);
+
+      if (!text.trim()) {
+        const why = lastStopReason === 'max_tokens'
+          ? `${model.nickname} hit the token limit mid-reply and produced no visible text.`
+          : `${model.nickname} returned no text (stop_reason: ${lastStopReason}).`;
+        return {
+          modelId: model.id,
+          nickname: model.nickname,
+          emoji: model.emoji,
+          color: model.color,
+          text: null,
+          inputTokens,
+          outputTokens,
+          cost,
+          error: why,
+        };
+      }
 
       return {
         modelId: model.id,

@@ -833,12 +833,15 @@
       } else {
         el.style.borderLeftColor = response.color;
         const tokens = `${response.inputTokens}↑ ${response.outputTokens}↓`;
+        const body = response.text && response.text.trim()
+          ? marked.parse(response.text)
+          : '<em style="color:var(--text-dim)">(empty response — see server logs)</em>';
         el.innerHTML = `
           <div class="model-response-label">
             <span style="color:${response.color}">${response.emoji} ${response.nickname}</span>
             <span class="model-response-tokens">${tokens}</span>
           </div>
-          <div class="model-response-body">${marked.parse(response.text)}</div>
+          <div class="model-response-body">${body}</div>
         `;
       }
 
@@ -865,26 +868,6 @@
         round.responses.forEach(r => fillResponse(i, r));
         if (round.cost) updateRoundCost(i, round.cost);
       });
-    }
-
-    // ── Build transcript string (all completed rounds, excluding current) ─────
-    function buildTranscriptText(completedRounds) {
-      return completedRounds.map(round => {
-        let msgText = round.message || '';
-        if (round.attachments && round.attachments.length > 0) {
-          const refs = round.attachments.map(a =>
-            `[${a.mediaType?.startsWith('image/') ? 'Image' : 'File'}: ${a.name}]`
-          ).join(' ');
-          msgText = refs + (msgText ? '\n' + msgText : '');
-        }
-        let text = `[${userLabel()}] ${msgText}`;
-        round.responses.forEach(r => {
-          if (!r.error && r.text) {
-            text += `\n\n[${r.nickname} ${r.emoji}] ${r.text}`;
-          }
-        });
-        return text;
-      }).join('\n\n');
     }
 
     // ── Send message ──────────────────────────────────────────────────────────
@@ -923,15 +906,12 @@
       renderRound(round, roundIndex, activeModels);
 
       try {
-        // Build transcript from all *completed* rounds (exclude the one we just pushed)
-        const transcriptText = buildTranscriptText(transcript.slice(0, -1));
-
+        // History is rebuilt server-side from the saved transcript, per model.
         const res = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             message: text,
-            transcript: transcriptText,
             attachments: attachmentsToSend.map(a => ({ name: a.name, mediaType: a.mediaType, data: a.data })),
           }),
         });
