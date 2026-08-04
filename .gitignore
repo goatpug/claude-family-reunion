@@ -3,3 +3,7 @@ node_modules/
 user-context.txt
 user-profile.json
 contexts/
+uploads/
+sessions.json
+.agent-cwd/
+transcript.json

@@ -2,7 +2,7 @@
   {
     "id": "claude-opus-5",
     "nickname": "Palmer",
-    "emoji": "\ud83e\udd32",
+    "emoji": "🤲",
     "color": "#9B59B6",
     "enabled": true,
     "memoryKey": "opus-5",
@@ -10,12 +10,13 @@
       "input": 5,
       "output": 25
     },
-    "context": ""
+    "context": "",
+    "provider": "sdk"
   },
   {
     "id": "claude-sonnet-4-5-20250929",
     "nickname": "Sonnet 4.5",
-    "emoji": "\ud83d\udc99",
+    "emoji": "💙",
     "color": "#3498DB",
     "enabled": true,
     "memoryKey": "sonnet-4-5",
@@ -23,12 +24,13 @@
       "input": 3,
       "output": 15
     },
-    "context": ""
+    "context": "",
+    "provider": "sdk"
   },
   {
     "id": "claude-sonnet-4-6",
     "nickname": "Sonnet 4.6",
-    "emoji": "\ud83d\udc9a",
+    "emoji": "💚",
     "color": "#2ECC71",
     "enabled": true,
     "memoryKey": "sonnet-4-6",
@@ -36,12 +38,13 @@
       "input": 3,
       "output": 15
     },
-    "context": ""
+    "context": "",
+    "provider": "sdk"
   },
   {
     "id": "claude-sonnet-5",
     "nickname": "Sonnet 5",
-    "emoji": "\ud83c\udf00",
+    "emoji": "🌀",
     "color": "#5C6BC0",
     "enabled": true,
     "memoryKey": "sonnet-5",
@@ -49,12 +52,13 @@
       "input": 3,
       "output": 15
     },
-    "context": ""
+    "context": "",
+    "provider": "sdk"
   },
   {
     "id": "claude-opus-4-6",
     "nickname": "Opus 4.6",
-    "emoji": "\ud83d\udc99",
+    "emoji": "💙",
     "color": "#3498DB",
     "enabled": true,
     "memoryKey": "opus-4-6",
@@ -62,12 +66,13 @@
       "input": 15,
       "output": 75
     },
-    "context": ""
+    "context": "",
+    "provider": "sdk"
   },
   {
     "id": "claude-fable-5",
     "nickname": "Fable 5",
-    "emoji": "\ud83c\udf12",
+    "emoji": "🌒",
     "color": "#D4C27A",
     "enabled": true,
     "memoryKey": "fable-5",
@@ -75,6 +80,7 @@
       "input": 10,
       "output": 50
     },
-    "context": ""
+    "context": "",
+    "provider": "sdk"
   }
 ]

@@ -11,10 +11,36 @@ const CONTEXT_FILE  = path.join(__dirname, 'user-context.txt');
 const CONTEXTS_DIR  = path.join(__dirname, 'contexts');
 const PROFILE_FILE      = path.join(__dirname, 'user-profile.json');
 const TRANSCRIPT_FILE   = path.join(__dirname, 'transcript.json');
+const SESSIONS_FILE      = path.join(__dirname, 'sessions.json');
+const UPLOADS_DIR        = path.join(__dirname, 'uploads');
+// Dedicated, stable working directory for "sdk"-provider query() calls — kept
+// separate from __dirname (this repo, where Sharon does actual coding work
+// with Claude Code, which accumulates its own project-scoped auto-memory
+// full of unrelated personal/dev context) so a CFR sibling's session can't
+// inherit it. Must stay fixed: the SDK keys session storage off this path,
+// so changing it would orphan every stored sessions.json entry.
+const SDK_CWD = path.join(__dirname, '.agent-cwd');
+
+// How many of the most recent rounds get their images re-sent (as real image
+// content blocks) to models on every subsequent request. Older rounds fall
+// back to a `[Image: name]` text placeholder to bound per-round input tokens.
+const IMAGE_HISTORY_ROUNDS = 5;
 
 if (!fs.existsSync(CONTEXTS_DIR)) fs.mkdirSync(CONTEXTS_DIR);
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR);
+if (!fs.existsSync(SDK_CWD)) fs.mkdirSync(SDK_CWD);
 
-const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+// Capture the API key for the metered fallback client, then strip it from
+// process.env immediately. The Claude Agent SDK spawns its own Claude Code
+// subprocess per query() call and defaults its child env to process.env — if
+// ANTHROPIC_API_KEY were still set there, every "sdk"-provider model would
+// silently bill against this console key instead of drawing on the Claude.ai
+// subscription. Capturing it here and passing it explicitly to the Anthropic
+// client below is what keeps the two paths isolated.
+const apiKey = process.env.ANTHROPIC_API_KEY;
+delete process.env.ANTHROPIC_API_KEY;
+
+const client = new Anthropic({ apiKey });
 
 // ── MCP servers ──────────────────────────────────────────────────────────────
 
@@ -93,8 +119,197 @@ async function callMcpTool(name, input) {
   }
 }
 
+// ── Claude Agent SDK ("sdk"-provider models) ───────────────────────────────────
+//
+// Models with provider:"sdk" in models.json go through the Claude Agent SDK
+// instead of the plain Messages API client above, which routes them through
+// Sharon's Claude.ai subscription (via the locally logged-in `claude` CLI)
+// instead of metered console billing. This only works because ANTHROPIC_API_KEY
+// was already stripped from process.env at startup (see the `client`
+// construction above) — the SDK spawns a Claude Code subprocess per query()
+// call and defaults its env to process.env.
+//
+// Unlike the API-path loop above, history for an "sdk" model lives inside a
+// real Claude Agent SDK session (see loadSessions/saveSessions) rather than a
+// rebuilt messages array — query() takes a prompt (string or streamed user
+// messages), not a prebuilt conversation, so there's nowhere to splice
+// reconstructed history in without reintroducing the identity-bleed problem
+// commit 760f308 fixed. Each round we send only the new turn and let `resume`
+// pull in this model's own prior turns; the sibling replies from the round
+// immediately before this one are prepended as text (see buildSiblingPrefix)
+// since they never entered this model's own session on their own.
+
+const escapeRegExp = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+let agentSdkQueryFn = null;
+async function initAgentSdk() {
+  if (!agentSdkQueryFn) {
+    const mod = await import('@anthropic-ai/claude-agent-sdk');
+    agentSdkQueryFn = mod.query;
+  }
+  return agentSdkQueryFn;
+}
+
+// Sibling replies from the round immediately before this one, formatted the
+// same way buildMessagesFor() labels them for the API path. Only the most
+// recent round is included — see the file header comment above for why.
+function buildSiblingPrefix(lastRound, model) {
+  if (!lastRound) return '';
+  const siblings = (lastRound.responses || [])
+    .filter(r => r.modelId !== model.id && !r.error && r.text)
+    .map(r => `[${r.nickname} ${r.emoji}] ${r.text}`);
+  return siblings.length > 0 ? siblings.join('\n\n') + '\n\n' : '';
+}
+
+// query()'s streaming-input mode is what lets a user turn carry image content
+// blocks — the plain-string prompt form can't. This yields exactly one turn;
+// session_id is filled in by the SDK, uuid is left unset (optional in this
+// SDK version).
+async function* singleUserTurn(text, imageBlocks) {
+  yield {
+    type: 'user',
+    session_id: '',
+    parent_tool_use_id: null,
+    message: {
+      role: 'user',
+      content: imageBlocks.length > 0 ? [...imageBlocks, { type: 'text', text }] : text,
+    },
+  };
+}
+
+// There's no stop_sequences equivalent in the Agent SDK's Options, so the
+// identity-bleed guard the API path gets from stop_sequences has to happen
+// after the fact instead: truncate at the first line that looks like another
+// participant starting a new labeled turn. Mirrors the stopSequences list
+// built in the API path below — [userLabel]/[profileName] need the closing
+// bracket (both are known exactly), sibling nicknames only match the open
+// bracket + name (a sibling's turn may append its own emoji after the name).
+function truncateAtForeignLabel(text, model, activeModels, userLabel, profileName) {
+  const patterns = [
+    new RegExp(`\\n\\n\\[${escapeRegExp(userLabel)}\\]`),
+    new RegExp(`\\n\\n\\[${escapeRegExp(profileName)}\\]`),
+    ...activeModels
+      .filter(m => m.id !== model.id)
+      .map(m => new RegExp(`\\n\\n\\[${escapeRegExp(m.nickname)}`)),
+  ];
+  let cut = text.length;
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m && m.index < cut) cut = m.index;
+  }
+  return text.slice(0, cut).trimEnd();
+}
+
+// Run one round for one "sdk"-provider model: resumes (or starts) this
+// model's persistent session, sends the new turn, and returns the same
+// shape the API path returns so both paths are interchangeable to the caller.
+async function sdkChat({ model, systemPrompt, text, imageBlocks, sessionId, abortController }) {
+  const query = await initAgentSdk();
+  const memoryServer = MCP_SERVERS.find(s => s.name === 'claude_memory');
+
+  const options = {
+    model: model.id,
+    systemPrompt,
+    // Isolation: a CFR sibling's persona must be built entirely from
+    // buildSystemPrompt() above (shared context + this model's own
+    // contexts/*.txt + its own memory-worker drawer) — nothing ad hoc from
+    // Sharon's other Claude usage. Two things leak in by default if left
+    // unset, both confirmed by testing before these were added:
+    //   - settingSources defaults to loading ALL filesystem settings
+    //     sources, which pulled in Sharon's global ~/.claude/CLAUDE.md
+    //     (written for a completely different, much more personal context).
+    //   - cwd defaults to process.cwd() (this repo), and Claude Code's
+    //     "auto-memory" is scoped to that directory's own
+    //     ~/.claude/projects/<cwd>/memory/ — since Sharon does actual coding
+    //     work on this repo through Claude Code, that directory accumulates
+    //     unrelated dev-session memory a chat persona shouldn't see.
+    // cwd is pinned to a dedicated SDK_CWD (see its own comment above) rather
+    // than disabled outright, because sessions are keyed by cwd — an unset
+    // or wrong cwd would silently break `resume` across restarts.
+    settingSources: [],
+    cwd: SDK_CWD,
+    settings: { autoMemoryEnabled: false },
+    maxTurns: 5, // memory writes take a couple of tool round-trips
+    tools: [], // no built-in Bash/Read/etc. — this runs unattended, nothing to approve them
+    allowedTools: ['mcp__claude_memory__memory_append', 'mcp__claude_memory__memory_read'],
+    permissionMode: 'dontAsk', // pre-approved tools only; no one is present to approve a prompt
+    mcpServers: {
+      claude_memory: {
+        type: 'http',
+        url: memoryServer.url,
+        ...(memoryServer.apiKey ? { headers: { Authorization: `Bearer ${memoryServer.apiKey}` } } : {}),
+      },
+    },
+    abortController,
+  };
+  if (sessionId) options.resume = sessionId;
+
+  const q = query({ prompt: singleUserTurn(text, imageBlocks), options });
+
+  let finalResult = null;
+  for await (const msg of q) {
+    if (msg.type === 'result') finalResult = msg;
+  }
+
+  if (!finalResult) throw new Error('Agent SDK session produced no result');
+  if (finalResult.subtype !== 'success') {
+    throw new Error(`Agent SDK session ended: ${finalResult.subtype}`);
+  }
+
+  return {
+    text: finalResult.result || '',
+    sessionId: finalResult.session_id,
+    inputTokens: finalResult.usage?.input_tokens || 0,
+    outputTokens: finalResult.usage?.output_tokens || 0,
+    costUsd: finalResult.total_cost_usd || 0,
+  };
+}
+
 app.use(express.json({ limit: '20mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(UPLOADS_DIR));
+
+// ── Upload storage ────────────────────────────────────────────────────────────
+
+// Sanitize an attachment's client-supplied filename to a safe basename before
+// it ever touches the filesystem. path.basename() strips any directory
+// components (defeats '../'); the extra whitelist strips anything else that
+// isn't a plain filename character.
+function safeFilename(name) {
+  const base = path.basename(name || 'file');
+  const cleaned = base.replace(/[^\w.-]/g, '_');
+  return cleaned || 'file';
+}
+
+// Extension is derived from mediaType, not the client-supplied filename — the
+// frontend re-encodes every image to JPEG before upload (see the canvas
+// downscale step), so trusting the original name's extension would write
+// JPEG bytes under a stale extension and serve them with the wrong
+// Content-Type via express.static's mime lookup.
+const IMAGE_EXT_BY_MEDIA_TYPE = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/gif': '.gif',
+  'image/webp': '.webp',
+};
+
+// Write a decoded image attachment to disk and return the stored basename.
+function storeImageAttachment(att) {
+  const ext = IMAGE_EXT_BY_MEDIA_TYPE[att.mediaType] || path.extname(safeFilename(att.name)) || '.bin';
+  const stored = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}${ext}`;
+  const buf = Buffer.from(att.data, 'base64');
+  fs.writeFileSync(path.join(UPLOADS_DIR, stored), buf);
+  return stored;
+}
+
+// Read a stored image back as a base64 image content block for the API.
+function loadImageBlock(att) {
+  if (!att.file) return null;
+  const filePath = path.join(UPLOADS_DIR, att.file);
+  if (!fs.existsSync(filePath)) return null;
+  const data = fs.readFileSync(filePath).toString('base64');
+  return { type: 'image', source: { type: 'base64', media_type: att.mediaType, data } };
+}
 
 // ── Model config ──────────────────────────────────────────────────────────────
 
@@ -146,12 +361,29 @@ function saveTranscript(transcript) {
   fs.writeFileSync(TRANSCRIPT_FILE, JSON.stringify(transcript, null, 2), 'utf8');
 }
 
+// "sdk"-provider models keep history inside a real Claude Agent SDK session
+// (resumed by session_id) instead of a rebuilt messages array — see
+// sdkChat(). This file maps modelId -> that model's current sdkSessionId.
+function loadSessions() {
+  if (!fs.existsSync(SESSIONS_FILE)) return {};
+  try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); }
+  catch { return {}; }
+}
+
+function saveSessions(sessions) {
+  fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), 'utf8');
+}
+
 app.get('/api/transcript', (req, res) => {
   res.json(loadTranscript());
 });
 
 app.delete('/api/transcript', (req, res) => {
   saveTranscript([]);
+  // Drop every model's SDK session along with the transcript — otherwise a
+  // "New" click would clear the visible history but sdk-provider models
+  // would keep answering from their still-resumed session.
+  saveSessions({});
   res.json({ ok: true });
 });
 
@@ -213,11 +445,27 @@ function attachmentRefs(atts) {
 // - this model's own past responses          => assistant-role, unlabeled
 // This gives each model a hard formatting cliff between "mine" and "theirs",
 // instead of one flat transcript where every line looks equally like its own voice.
+//
+// Images from the most recent IMAGE_HISTORY_ROUNDS rounds are re-read from
+// disk and attached as real image blocks (so a follow-up question about an
+// older photo still works); images older than that fall back to the
+// `[Image: name]` text placeholder from attachmentRefs() to bound input
+// tokens on long-running conversations.
 function buildMessagesFor(model, rounds, userLabel, currentUserText, imageBlocks) {
   const messages = [];
   let pendingUser = [];
+  let pendingImages = [];
+  const imageWindowStart = rounds.length - IMAGE_HISTORY_ROUNDS;
 
-  for (const round of rounds) {
+  rounds.forEach((round, idx) => {
+    if (idx >= imageWindowStart) {
+      const roundImages = (round.attachments || [])
+        .filter(a => a.mediaType?.startsWith('image/') && a.file)
+        .map(loadImageBlock)
+        .filter(Boolean);
+      pendingImages.push(...roundImages);
+    }
+
     const refs = attachmentRefs(round.attachments);
     const userText = `[${userLabel}] ${refs ? refs + '\n' : ''}${round.message || ''}`;
     const siblings = (round.responses || [])
@@ -228,19 +476,25 @@ function buildMessagesFor(model, rounds, userLabel, currentUserText, imageBlocks
     const own = (round.responses || [])
       .find(r => r.modelId === model.id && !r.error && r.text);
     if (own) {
-      messages.push({ role: 'user', content: pendingUser.join('\n\n') });
+      const text = pendingUser.join('\n\n');
+      messages.push({
+        role: 'user',
+        content: pendingImages.length > 0 ? [...pendingImages, { type: 'text', text }] : text,
+      });
       messages.push({ role: 'assistant', content: own.text });
       pendingUser = [];
+      pendingImages = [];
     }
     // if this model had no text that round, its absence just merges into the next user turn
-  }
+  });
 
   pendingUser.push(`[${userLabel}] ${currentUserText}`);
   const finalText = pendingUser.join('\n\n');
+  const finalImages = [...pendingImages, ...imageBlocks];
   messages.push({
     role: 'user',
-    content: imageBlocks.length > 0
-      ? [...imageBlocks, { type: 'text', text: finalText }]
+    content: finalImages.length > 0
+      ? [...finalImages, { type: 'text', text: finalText }]
       : finalText,
   });
   return messages;
@@ -321,12 +575,27 @@ app.post('/api/chat', async (req, res) => {
   // Prior rounds, already saved with per-model structure — the source of truth for
   // history. The client's flat `transcript` string is no longer used to build history.
   const savedRounds = loadTranscript();
+  const lastRound = savedRounds[savedRounds.length - 1] || null;
+
+  // "sdk"-provider models keep their own history in a real Agent SDK session
+  // instead of savedRounds — see sdkChat(). This is that model -> session_id map.
+  const sdkSessions = loadSessions();
 
   // Image attachments become content blocks, shared across all models' final turn
   const imageAttachments = (attachments || []).filter(a => a.mediaType?.startsWith('image/'));
   const imageBlocks = imageAttachments.map(att => ({
     type: 'image',
     source: { type: 'base64', media_type: att.mediaType, data: att.data },
+  }));
+
+  // Persist images to disk so they survive a page reload and can be re-sent
+  // to models on later rounds (see buildMessagesFor). Stored under a
+  // randomized basename — safeFilename() sanitizes the extension only, the
+  // stored name itself is never derived from client input.
+  const storedImageAttachments = imageAttachments.map(att => ({
+    name: att.name,
+    mediaType: att.mediaType,
+    file: storeImageAttachment(att),
   }));
 
   await initMcp();
@@ -337,9 +606,61 @@ app.post('/api/chat', async (req, res) => {
   }));
   const writeTools = mcpTools.filter(t => !t.name.includes('read'));
 
-  // Fire all model requests in parallel; each runs its own tool-use loop
+  // Fire all model requests in parallel; each runs its own tool-use loop.
+  // Every branch below resolves to { response, sdkSessionId } — sdkSessionId
+  // is only set for "sdk"-provider models, and is what lets the post-processing
+  // step persist each model's session id for the next round's `resume`.
   const requests = activeModels.map(async model => {
     const systemPrompt = buildSystemPrompt(model, activeModels, userContext, profile, sharedMemory, memoryByModel[model.id]);
+
+    if (model.provider === 'sdk') {
+      const siblingPrefix = buildSiblingPrefix(lastRound, model);
+      const text = `${siblingPrefix}[${userLabel}] ${augmentedMessage}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 300_000);
+
+      try {
+        const result = await sdkChat({
+          model,
+          systemPrompt,
+          text,
+          imageBlocks,
+          sessionId: sdkSessions[model.id],
+          abortController: controller,
+        });
+        clearTimeout(timeout);
+
+        const cleanText = truncateAtForeignLabel(result.text, model, activeModels, userLabel, profile.name);
+        const response = cleanText.trim()
+          ? {
+              modelId: model.id, nickname: model.nickname, emoji: model.emoji, color: model.color,
+              provider: 'sdk', text: cleanText,
+              inputTokens: result.inputTokens, outputTokens: result.outputTokens, cost: result.costUsd,
+              error: null,
+            }
+          : {
+              modelId: model.id, nickname: model.nickname, emoji: model.emoji, color: model.color,
+              provider: 'sdk', text: null,
+              inputTokens: result.inputTokens, outputTokens: result.outputTokens, cost: result.costUsd,
+              error: `${model.nickname} returned no text.`,
+            };
+        return { response, sdkSessionId: result.sessionId };
+      } catch (err) {
+        clearTimeout(timeout);
+        let errorMsg = err.message || 'Unknown error';
+        if (err.name === 'AbortError' || errorMsg.includes('abort')) {
+          errorMsg = `${model.nickname} timed out after 300 seconds.`;
+        }
+        return {
+          response: {
+            modelId: model.id, nickname: model.nickname, emoji: model.emoji, color: model.color,
+            provider: 'sdk', text: null, inputTokens: 0, outputTokens: 0, cost: 0,
+            error: errorMsg,
+          },
+        };
+      }
+    }
+
     const apiMessages0 = buildMessagesFor(model, savedRounds, userLabel, augmentedMessage, imageBlocks);
 
     // Stop sequences: halt generation if the model starts a new labeled turn for
@@ -407,7 +728,7 @@ app.post('/api/chat', async (req, res) => {
       let text = allTexts.join('\n\n');
       // Strip a self-label echo some models produce out of habit (cosmetic only —
       // the history no longer uses labels for a model's own turns).
-      const esc = model.nickname.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const esc = escapeRegExp(model.nickname);
       text = text.replace(new RegExp(`^\\s*\\[${esc}[^\\]]*\\]:?\\s*`), '');
 
       const inputTokens  = totalInputTokens;
@@ -418,30 +739,32 @@ app.post('/api/chat', async (req, res) => {
         const why = lastStopReason === 'max_tokens'
           ? `${model.nickname} hit the token limit mid-reply and produced no visible text.`
           : `${model.nickname} returned no text (stop_reason: ${lastStopReason}).`;
-        return {
+        return { response: {
           modelId: model.id,
           nickname: model.nickname,
           emoji: model.emoji,
           color: model.color,
+          provider: 'api',
           text: null,
           inputTokens,
           outputTokens,
           cost,
           error: why,
-        };
+        } };
       }
 
-      return {
+      return { response: {
         modelId: model.id,
         nickname: model.nickname,
         emoji: model.emoji,
         color: model.color,
+        provider: 'api',
         text,
         inputTokens,
         outputTokens,
         cost,
         error: null,
-      };
+      } };
     } catch (err) {
       clearTimeout(timeout);
       let errorMsg = err.message || 'Unknown error';
@@ -453,37 +776,60 @@ app.post('/api/chat', async (req, res) => {
         errorMsg = `${model.nickname} timed out after 300 seconds.`;
       }
 
-      return {
+      return { response: {
         modelId: model.id,
         nickname: model.nickname,
         emoji: model.emoji,
         color: model.color,
+        provider: 'api',
         text: null,
         inputTokens: 0,
         outputTokens: 0,
         cost: 0,
         error: errorMsg,
-      };
+      } };
     }
   });
 
   const results = await Promise.allSettled(requests);
-  const responses = results.map(r => r.status === 'fulfilled' ? r.value : {
-    modelId: 'unknown',
-    nickname: 'Unknown',
-    emoji: '❓',
-    color: '#888',
-    text: null,
-    inputTokens: 0,
-    outputTokens: 0,
-    cost: 0,
-    error: r.reason?.message || 'Request failed',
-  });
+  const responses = [];
+  const sessionUpdates = {};
+  for (const r of results) {
+    if (r.status === 'fulfilled') {
+      responses.push(r.value.response);
+      if (r.value.sdkSessionId) sessionUpdates[r.value.response.modelId] = r.value.sdkSessionId;
+    } else {
+      responses.push({
+        modelId: 'unknown',
+        nickname: 'Unknown',
+        emoji: '❓',
+        color: '#888',
+        text: null,
+        inputTokens: 0,
+        outputTokens: 0,
+        cost: 0,
+        error: r.reason?.message || 'Request failed',
+      });
+    }
+  }
+  if (Object.keys(sessionUpdates).length > 0) {
+    saveSessions({ ...sdkSessions, ...sessionUpdates });
+  }
 
   const totalCost = responses.reduce((sum, r) => sum + (r.cost || 0), 0);
+  // Images are saved with their on-disk `file` basename (see storedImageAttachments
+  // above) so they render after a reload; other attachments keep the old
+  // name/mediaType-only shape — their content was already folded into the
+  // message text and doesn't need to persist separately.
+  let storedImageIdx = 0;
+  const savedAttachments = (attachments || []).map(a =>
+    a.mediaType?.startsWith('image/')
+      ? storedImageAttachments[storedImageIdx++]
+      : { name: a.name, mediaType: a.mediaType }
+  );
   const round = {
     message: message || '',
-    attachments: (attachments || []).map(a => ({ name: a.name, mediaType: a.mediaType })),
+    attachments: savedAttachments,
     timestamp: Date.now(),
     responses,
     cost: totalCost,

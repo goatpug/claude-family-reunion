@@ -631,8 +631,11 @@
       if (!attachments || attachments.length === 0) return '';
       const displayAtts = attachmentDisplayData[roundIndex] || attachments;
       const parts = displayAtts.map(att => {
-        if (att.mediaType && att.mediaType.startsWith('image/') && att.dataUrl) {
-          return `<img src="${att.dataUrl}" class="msg-attachment-img" alt="${escapeHtml(att.name)}">`;
+        // dataUrl: this-session cache (just sent, not yet persisted to disk read-path).
+        // file: server-stored basename under /uploads — survives reload.
+        const src = att.dataUrl || (att.file ? `/uploads/${encodeURIComponent(att.file)}` : null);
+        if (att.mediaType && att.mediaType.startsWith('image/') && src) {
+          return `<img src="${src}" class="msg-attachment-img" alt="${escapeHtml(att.name)}">`;
         }
         return `<span class="msg-attachment-chip">📄 ${escapeHtml(att.name)}</span>`;
       });
@@ -832,7 +835,13 @@
         `;
       } else {
         el.style.borderLeftColor = response.color;
-        const tokens = `${response.inputTokens}↑ ${response.outputTokens}↓`;
+        // "sdk"-provider models run on the Claude.ai subscription, not metered
+        // API billing — the cost is still recorded (for the token/pacing
+        // signal) but it's a nominal equivalent, not money actually spent, so
+        // label it as such instead of presenting it like a real charge.
+        const tokens = response.provider === 'sdk'
+          ? `${response.inputTokens}↑ ${response.outputTokens}↓ · subscription (~${formatCost(response.cost || 0)} equiv.)`
+          : `${response.inputTokens}↑ ${response.outputTokens}↓`;
         const body = response.text && response.text.trim()
           ? marked.parse(response.text)
           : '<em style="color:var(--text-dim)">(empty response — see server logs)</em>';
@@ -1063,27 +1072,114 @@
     sendBtn.addEventListener('click', sendMessage);
     messageInput.addEventListener('input', () => autoResize(messageInput));
 
+    // Images beyond this on the long edge are downscaled before upload — matches
+    // the high-res vision cap (2576px) with headroom, and keeps phone photos from
+    // blowing up the request body or hitting the per-image API size limit.
+    const MAX_IMAGE_DIMENSION = 2048;
+    const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // pre-downscale sanity cap
+
+    // Decode an image file in a canvas and re-encode as JPEG, capped at
+    // MAX_IMAGE_DIMENSION on the long edge. Also normalizes formats the <img>
+    // tag can display but the API can't take verbatim (e.g. iOS HEIC — Safari/
+    // Chrome decode it into the Image element fine even though canvas re-encode
+    // is what actually produces a JPEG the API accepts).
+    function downscaleImage(file) {
+      return new Promise((resolve, reject) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          URL.revokeObjectURL(url);
+          let { naturalWidth: width, naturalHeight: height } = img;
+          const longEdge = Math.max(width, height);
+          if (longEdge > MAX_IMAGE_DIMENSION) {
+            const scale = MAX_IMAGE_DIMENSION / longEdge;
+            width = Math.round(width * scale);
+            height = Math.round(height * scale);
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width;
+          canvas.height = height;
+          canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+          resolve({ dataUrl, data: dataUrl.split(',')[1], mediaType: 'image/jpeg' });
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(url);
+          reject(new Error('could not decode image'));
+        };
+        img.src = url;
+      });
+    }
+
+    function readAsDataUrl(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = e => resolve(e.target.result);
+        reader.onerror = () => reject(reader.error || new Error('read failed'));
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // Shared entry point for the file picker, paste, and drag-and-drop —
+    // whatever brings a File object in goes through here so previews and
+    // removal behave identically regardless of source.
+    async function addAttachmentFiles(files) {
+      for (const file of files) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          alert(`${file.name} is too large (max 20 MB).`);
+          continue;
+        }
+        const isImage = file.type && file.type.startsWith('image/');
+        try {
+          if (isImage) {
+            const { dataUrl, data, mediaType } = await downscaleImage(file);
+            pendingAttachments.push({ name: file.name, mediaType, data, dataUrl });
+          } else {
+            const dataUrl = await readAsDataUrl(file);
+            const data = dataUrl.split(',')[1];
+            pendingAttachments.push({ name: file.name, mediaType: file.type || 'text/plain', data, dataUrl });
+          }
+        } catch (e) {
+          alert(`Couldn't attach ${file.name}: ${e.message}`);
+        }
+      }
+      renderAttachmentPreviews();
+    }
+
     attachBtn.addEventListener('click', () => fileInput.click());
     fileInput.addEventListener('change', async () => {
       const files = Array.from(fileInput.files);
       fileInput.value = '';
-      for (const file of files) {
-        if (file.size > 10 * 1024 * 1024) {
-          alert(`${file.name} is too large (max 10 MB).`);
-          continue;
-        }
-        await new Promise(resolve => {
-          const reader = new FileReader();
-          reader.onload = e => {
-            const dataUrl = e.target.result;
-            const data = dataUrl.split(',')[1];
-            pendingAttachments.push({ name: file.name, mediaType: file.type || 'text/plain', data, dataUrl });
-            resolve();
-          };
-          reader.readAsDataURL(file);
-        });
-      }
-      renderAttachmentPreviews();
+      await addAttachmentFiles(files);
+    });
+
+    // Paste an image from the clipboard directly into the message box.
+    messageInput.addEventListener('paste', async (e) => {
+      const items = Array.from(e.clipboardData?.items || []);
+      const files = items
+        .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+        .map(item => item.getAsFile())
+        .filter(Boolean);
+      if (files.length === 0) return; // let normal text paste through
+      e.preventDefault();
+      await addAttachmentFiles(files);
+    });
+
+    // Drag-and-drop onto the whole input area.
+    const inputArea = document.getElementById('input-area');
+    inputArea.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      inputArea.style.borderTopColor = 'var(--accent)';
+    });
+    inputArea.addEventListener('dragleave', () => {
+      inputArea.style.borderTopColor = '';
+    });
+    inputArea.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      inputArea.style.borderTopColor = '';
+      const files = Array.from(e.dataTransfer?.files || []);
+      if (files.length === 0) return;
+      await addAttachmentFiles(files);
     });
 
     btnSettings.addEventListener('click', () => {
