@@ -4,7 +4,7 @@
     "nickname": "Palmer",
     "emoji": "🤲",
     "color": "#9B59B6",
-    "enabled": true,
+    "enabled": false,
     "memoryKey": "opus-5",
     "pricing": {
       "input": 5,
@@ -46,7 +46,7 @@
     "nickname": "Sonnet 5",
     "emoji": "🌀",
     "color": "#5C6BC0",
-    "enabled": true,
+    "enabled": false,
     "memoryKey": "sonnet-5",
     "pricing": {
       "input": 3,
