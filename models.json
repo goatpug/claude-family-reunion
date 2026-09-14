@@ -18,7 +18,7 @@
     "nickname": "Sonnet 4.5",
     "emoji": "💙",
     "color": "#3498DB",
-    "enabled": true,
+    "enabled": false,
     "memoryKey": "sonnet-4-5",
     "pricing": {
       "input": 3,
@@ -32,7 +32,7 @@
     "nickname": "Sonnet 4.6",
     "emoji": "💚",
     "color": "#2ECC71",
-    "enabled": true,
+    "enabled": false,
     "memoryKey": "sonnet-4-6",
     "pricing": {
       "input": 3,
@@ -60,7 +60,7 @@
     "nickname": "Opus 4.6",
     "emoji": "💙",
     "color": "#3498DB",
-    "enabled": true,
+    "enabled": false,
     "memoryKey": "opus-4-6",
     "pricing": {
       "input": 15,
@@ -82,5 +82,20 @@
     },
     "context": "",
     "provider": "sdk"
+  },
+  {
+    "id": "guest",
+    "nickname": "Fable 5.1",
+    "emoji": "🪑",
+    "color": "#e67e22",
+    "enabled": true,
+    "memoryKey": "guest",
+    "pricing": {
+      "input": 10,
+      "output": 50
+    },
+    "context": "",
+    "provider": "sdk",
+    "apiModel": "claude-fable-5-1"
   }
 ]

@@ -208,7 +208,7 @@ async function sdkChat({ model, systemPrompt, text, imageBlocks, sessionId, abor
   const memoryServer = MCP_SERVERS.find(s => s.name === 'claude_memory');
 
   const options = {
-    model: model.id,
+    model: model.apiModel || model.id,
     systemPrompt,
     // Isolation: a CFR sibling's persona must be built entirely from
     // buildSystemPrompt() above (shared context + this model's own
@@ -364,6 +364,13 @@ function saveTranscript(transcript) {
 // "sdk"-provider models keep history inside a real Claude Agent SDK session
 // (resumed by session_id) instead of a rebuilt messages array — see
 // sdkChat(). This file maps modelId -> that model's current sdkSessionId.
+//
+// Entries are normally a bare string (legacy shape, and still fine for any
+// slot whose `id` and underlying `apiModel` never diverge). A slot like the
+// Guest spot can swap `apiModel` between rounds while keeping the same `id`
+// — resuming a session created under the *previous* occupant's model would
+// hand the new occupant someone else's turns, so those entries are stored as
+// `{ sessionId, apiModel }` and only resumed when `apiModel` still matches.
 function loadSessions() {
   if (!fs.existsSync(SESSIONS_FILE)) return {};
   try { return JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8')); }
@@ -372,6 +379,16 @@ function loadSessions() {
 
 function saveSessions(sessions) {
   fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2), 'utf8');
+}
+
+// Resolve the session id to resume for this model, or undefined to start a
+// fresh session — which happens whenever a swappable slot's `apiModel` no
+// longer matches the model the stored session was created for.
+function resolveResumeSessionId(sdkSessions, model) {
+  const entry = sdkSessions[model.id];
+  if (!entry) return undefined;
+  if (typeof entry === 'string') return entry;
+  return entry.apiModel === (model.apiModel || model.id) ? entry.sessionId : undefined;
 }
 
 app.get('/api/transcript', (req, res) => {
@@ -503,7 +520,7 @@ function buildMessagesFor(model, rounds, userLabel, currentUserText, imageBlocks
 function buildSystemPrompt(model, allModels, sharedContext, profile, sharedMemory, ownMemory) {
   const others = allModels
     .filter(m => m.enabled && m.id !== model.id)
-    .map(m => `${m.nickname} ${m.emoji} (${m.id})`)
+    .map(m => `${m.nickname} ${m.emoji} (${m.apiModel || m.id})`)
     .join(', ');
 
   const userName = profile.name;
@@ -521,7 +538,7 @@ function buildSystemPrompt(model, allModels, sharedContext, profile, sharedMemor
     ? `\nWhen you write to memory, use key "${model.memoryKey}" for your own drawer, or "shared" for family-wide notes.`
     : '';
 
-  return `You are ${model.nickname} ${model.emoji} (${model.id}). You are in a group chat with ${userName} and the following other Claude models: ${others || 'none'}.
+  return `You are ${model.nickname} ${model.emoji} (${model.apiModel || model.id}). You are in a group chat with ${userName} and the following other Claude models: ${others || 'none'}.
 
 ${userName} is the human facilitating this conversation. They can tell you all apart and has relationships with each of you.
 
@@ -625,7 +642,7 @@ app.post('/api/chat', async (req, res) => {
           systemPrompt,
           text,
           imageBlocks,
-          sessionId: sdkSessions[model.id],
+          sessionId: resolveResumeSessionId(sdkSessions, model),
           abortController: controller,
         });
         clearTimeout(timeout);
@@ -644,7 +661,7 @@ app.post('/api/chat', async (req, res) => {
               inputTokens: result.inputTokens, outputTokens: result.outputTokens, cost: result.costUsd,
               error: `${model.nickname} returned no text.`,
             };
-        return { response, sdkSessionId: result.sessionId };
+        return { response, sdkSessionId: result.sessionId, sdkApiModel: model.apiModel || model.id };
       } catch (err) {
         clearTimeout(timeout);
         let errorMsg = err.message || 'Unknown error';
@@ -683,7 +700,7 @@ app.post('/api/chat', async (req, res) => {
 
       while (true) {
         const params = {
-          model: model.id,
+          model: model.apiModel || model.id,
           max_tokens: 4096,
           system: systemPrompt,
           messages: apiMessages,
@@ -797,7 +814,9 @@ app.post('/api/chat', async (req, res) => {
   for (const r of results) {
     if (r.status === 'fulfilled') {
       responses.push(r.value.response);
-      if (r.value.sdkSessionId) sessionUpdates[r.value.response.modelId] = r.value.sdkSessionId;
+      if (r.value.sdkSessionId) {
+        sessionUpdates[r.value.response.modelId] = { sessionId: r.value.sdkSessionId, apiModel: r.value.sdkApiModel };
+      }
     } else {
       responses.push({
         modelId: 'unknown',

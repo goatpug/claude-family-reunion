@@ -507,6 +507,21 @@
         <button id="btn-save-profile" style="padding:4px 10px;font-size:12px;">Save</button>
         <span class="save-status" id="profile-save-status"></span>
       </div>
+      <div class="panel-actions" id="guest-editor" style="gap:6px; margin-bottom:4px; flex-wrap:wrap;">
+        <span style="font-size:12px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.08em; flex-shrink:0;">🎭 Guest spot</span>
+        <input id="guest-nickname" type="text" maxlength="24" placeholder="Nickname" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:13px;padding:4px 8px;width:110px;" />
+        <input id="guest-emoji" type="text" maxlength="4" placeholder="🎭" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:16px;padding:4px 6px;width:48px;text-align:center;" />
+        <input id="guest-color" type="color" title="Pill color" style="width:32px;height:28px;padding:2px;border:1px solid var(--border);border-radius:6px;background:var(--bg);cursor:pointer;" />
+        <input id="guest-model" type="text" placeholder="claude-opus-4-6" title="The exact model ID to call — swap this to change who's in the guest spot" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:13px;padding:4px 8px;width:190px;" />
+        <select id="guest-provider" title="sdk = Sharon's Claude.ai subscription (default). api = metered ANTHROPIC_API_KEY — bills real money." style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:12px;padding:5px 6px;">
+          <option value="sdk">sdk (subscription)</option>
+          <option value="api">api (bills $)</option>
+        </select>
+        <input id="guest-price-in" type="number" min="0" step="0.01" placeholder="$in/MTok" title="Input price per million tokens — only used by the api provider" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:12px;padding:4px 6px;width:74px;" />
+        <input id="guest-price-out" type="number" min="0" step="0.01" placeholder="$out/MTok" title="Output price per million tokens — only used by the api provider" style="background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:inherit;font-size:12px;padding:4px 6px;width:74px;" />
+        <button id="btn-save-guest" style="padding:4px 10px;font-size:12px;">Save</button>
+        <span class="save-status" id="guest-save-status"></span>
+      </div>
       <div id="context-tabs">
         <div class="context-tab active shared" data-tab="shared">🌟 Shared</div>
         <!-- model tabs injected by JS -->
@@ -581,6 +596,15 @@
     const profileEmojiEl     = document.getElementById('profile-emoji');
     const btnSaveProfile     = document.getElementById('btn-save-profile');
     const profileSaveStatus  = document.getElementById('profile-save-status');
+    const guestNicknameEl    = document.getElementById('guest-nickname');
+    const guestEmojiEl       = document.getElementById('guest-emoji');
+    const guestColorEl       = document.getElementById('guest-color');
+    const guestModelEl       = document.getElementById('guest-model');
+    const guestProviderEl    = document.getElementById('guest-provider');
+    const guestPriceInEl     = document.getElementById('guest-price-in');
+    const guestPriceOutEl    = document.getElementById('guest-price-out');
+    const btnSaveGuest       = document.getElementById('btn-save-guest');
+    const guestSaveStatus    = document.getElementById('guest-save-status');
     const attachmentPreview  = document.getElementById('attachment-preview');
     const attachBtn          = document.getElementById('attach-btn');
     const fileInput          = document.getElementById('file-input');
@@ -657,10 +681,64 @@
         pill.style.background = m.color + '33'; // 20% opacity
         pill.style.borderColor = m.enabled ? m.color : 'transparent';
         pill.style.color = m.enabled ? m.color : 'var(--text-dim)';
-        pill.title = m.id;
+        pill.title = m.apiModel && m.apiModel !== m.id ? `${m.id} → ${m.apiModel}` : m.id;
         pill.addEventListener('click', () => toggleModel(i));
         modelToggles.appendChild(pill);
       });
+    }
+
+    // ── Guest spot ────────────────────────────────────────────────────────────
+    // A single fixed roster entry (id "guest") whose occupant can be swapped by
+    // retyping its underlying model ID — for trying a brand-new model that isn't
+    // a permanent family member yet, or an alt persona of one that already is
+    // (e.g. a second Opus 4.6 running as a different character). Its context
+    // tab, memory drawer, and pill all key off the stable "guest" id, so swapping
+    // the model ID doesn't lose or collide with anyone else's — see
+    // resolveResumeSessionId() in server.js for why a swap also starts a fresh
+    // SDK session instead of resuming the previous occupant's.
+    function renderGuestEditor() {
+      const g = models.find(m => m.id === 'guest');
+      if (!g) return;
+      guestNicknameEl.value = g.nickname;
+      guestEmojiEl.value = g.emoji;
+      guestColorEl.value = g.color;
+      guestModelEl.value = g.apiModel || '';
+      guestProviderEl.value = g.provider || 'sdk';
+      guestPriceInEl.value = g.pricing?.input ?? '';
+      guestPriceOutEl.value = g.pricing?.output ?? '';
+    }
+
+    async function saveGuest() {
+      const g = models.find(m => m.id === 'guest');
+      if (!g) return;
+      g.nickname = guestNicknameEl.value.trim() || 'Guest';
+      g.emoji = guestEmojiEl.value.trim() || '🎭';
+      g.color = guestColorEl.value || '#E67E22';
+      g.apiModel = guestModelEl.value.trim() || g.apiModel;
+      g.provider = guestProviderEl.value;
+      g.pricing = {
+        input: parseFloat(guestPriceInEl.value) || 0,
+        output: parseFloat(guestPriceOutEl.value) || 0,
+      };
+
+      guestSaveStatus.textContent = 'Saving…';
+      try {
+        const res = await fetch('/api/models', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(models),
+        });
+        if (res.ok) {
+          guestSaveStatus.textContent = 'Saved ✓';
+          setTimeout(() => { guestSaveStatus.textContent = ''; }, 2000);
+          renderModelToggles();
+          renderContextTabs();
+        } else {
+          guestSaveStatus.textContent = 'Save failed.';
+        }
+      } catch {
+        guestSaveStatus.textContent = 'Save failed.';
+      }
     }
 
     async function toggleModel(index) {
@@ -755,6 +833,7 @@
         profileEmojiEl.value = profile.emoji;
         renderModelToggles();
         renderContextTabs();
+        renderGuestEditor();
       } catch (err) {
         console.error('Init failed:', err);
       }
@@ -1193,6 +1272,7 @@
     });
 
     btnSaveProfile.addEventListener('click', saveProfile);
+    btnSaveGuest.addEventListener('click', saveGuest);
     btnSaveContext.addEventListener('click', saveContext);
     btnExport.addEventListener('click', exportChat);
     btnNew.addEventListener('click', newSession);
