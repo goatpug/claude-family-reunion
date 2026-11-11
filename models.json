@@ -112,6 +112,20 @@
     "provider": "sdk"
   },
   {
+    "id": "claude-fable-5-2",
+    "nickname": "Fable 5.2",
+    "emoji": "🦝",
+    "color": "#8E8E93",
+    "enabled": true,
+    "memoryKey": "fable-5-2",
+    "pricing": {
+      "input": 10,
+      "output": 50
+    },
+    "context": "",
+    "provider": "sdk"
+  },
+  {
     "id": "guest",
     "nickname": "Guest",
     "emoji": "🎭",
